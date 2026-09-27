@@ -225,6 +225,36 @@ def build_feature_matrix(
     return out
 
 
+NON_FEATURE_COLUMNS = frozenset(
+    {
+        config.LOAD_ACTUAL_COL,  # the target itself
+        config.LOAD_FORECAST_COL,  # TSO benchmark — a comparison column, not a model input
+        config.SOLAR_GEN_COL,  # reserved for the dispatch-optimization module
+        config.WIND_GEN_COL,  # reserved for the dispatch-optimization module
+        "origin_utc",  # bookkeeping, not a feature
+        "is_duplicate_timestamp",  # data.py QC flag
+        "is_missing_hour",  # data.py QC flag
+        "is_implausible_load",  # data.py QC flag
+        "is_spike",  # data.py QC flag
+        "exclude_long_gap",  # data.py QC flag
+    }
+)
+
+
+def select_feature_columns(feature_matrix: pd.DataFrame) -> list[str]:
+    """Columns of a built feature matrix that are legitimate model inputs.
+
+    Excludes the target column, the TSO benchmark (a comparison forecast,
+    not something our own model should be trained on), the solar/wind
+    generation columns (reserved for the dispatch-optimization module),
+    the origin_utc bookkeeping column, and data.py's QC flag columns.
+    Anything else build_feature_matrix produced (calendar, lag, rolling,
+    weather features, and any raw weather columns carried through from
+    data.merge_weather) is treated as a feature.
+    """
+    return [c for c in feature_matrix.columns if c not in NON_FEATURE_COLUMNS]
+
+
 def assert_no_leakage(feature_matrix: pd.DataFrame) -> None:
     """Invariant check used by tests/test_features.py. Verifies, purely
     from the feature_matrix's own bookkeeping (no access to raw data

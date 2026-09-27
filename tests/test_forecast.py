@@ -1,7 +1,8 @@
 """
 Tests for energy_dispatch.forecast — baselines, time-based splits, point
-metrics, and the rolling-origin backtest harness. LightGBM-dependent
-functions are intentionally not implemented yet and are not tested here.
+metrics, the LightGBM point model, and the rolling-origin backtest
+harness. LightGBM quantile models remain intentionally not implemented
+yet and are not tested here.
 """
 
 from __future__ import annotations
@@ -140,8 +141,8 @@ def test_rolling_origin_backtest_without_predict_fn_returns_baselines_only(synth
         test_start="2018-06-01",
         test_end="2018-06-30",
     )
-    assert list(result.columns) == ["y_true", "y_naive", "y_tso", "y_model"]
-    assert result["y_model"].isna().all()
+    assert list(result.columns) == ["y_true", "y_naive", "y_tso", "y_lgbm"]
+    assert result["y_lgbm"].isna().all()
     assert len(result) > 0
 
     local_dates = result.index.tz_convert(config.LOCAL_TZ).normalize().unique()
@@ -174,7 +175,7 @@ def test_rolling_origin_backtest_train_df_never_contains_future_rows(synthetic_d
     )
 
     assert len(calls) >= 3  # at least one call per calendar month in the range
-    assert result["y_model"].notna().any()
+    assert result["y_lgbm"].notna().any()
 
     # Every train_df handed to predict_fn must exclude all rows that
     # belong to that same call's forecast block (no peeking at the days
@@ -203,3 +204,105 @@ def test_rolling_origin_backtest_covers_every_day_in_range_exactly_once(syntheti
     assert len(seen_days) == len(set(seen_days)), "a day was forecast in more than one block"
     expected_days = pd.date_range("2018-01-01", "2018-02-28", freq="D", tz=config.LOCAL_TZ)
     assert set(seen_days) == set(expected_days)
+
+
+# ---------------------------------------------------------------------------
+# prepare_training_frame
+# ---------------------------------------------------------------------------
+
+def test_prepare_training_frame_drops_missing_target_rows(synthetic_df):
+    matrix = features.build_feature_matrix(synthetic_df, target_col=config.LOAD_ACTUAL_COL)
+    with_gap = matrix.copy()
+    missing_at = with_gap.index[1000]
+    with_gap.loc[missing_at, config.LOAD_ACTUAL_COL] = np.nan
+
+    prepared = forecast.prepare_training_frame(with_gap, config.LOAD_ACTUAL_COL)
+    assert missing_at not in prepared.index
+    assert len(prepared) == len(with_gap) - 1
+
+
+def test_prepare_training_frame_drops_exclude_long_gap_rows(synthetic_df):
+    matrix = features.build_feature_matrix(synthetic_df, target_col=config.LOAD_ACTUAL_COL)
+    flagged = matrix.copy()
+    flagged["exclude_long_gap"] = False
+    excluded_at = flagged.index[2000]
+    flagged.loc[excluded_at, "exclude_long_gap"] = True
+
+    prepared = forecast.prepare_training_frame(flagged, config.LOAD_ACTUAL_COL)
+    assert excluded_at not in prepared.index
+    assert len(prepared) == len(flagged) - 1
+
+
+def test_prepare_training_frame_keeps_rows_with_missing_features(synthetic_df):
+    # The first 168h of any series has NaN lag_168h/rolling_*_168h features
+    # by construction (no history yet) — prepare_training_frame must keep
+    # those rows (LightGBM handles NaN features natively), only dropping
+    # rows for a missing *target* or an excluded long gap.
+    matrix = features.build_feature_matrix(synthetic_df, target_col=config.LOAD_ACTUAL_COL)
+    first_row = matrix.index[0]
+    assert pd.isna(matrix.loc[first_row, "lag_168h"])
+
+    prepared = forecast.prepare_training_frame(matrix, config.LOAD_ACTUAL_COL)
+    assert first_row in prepared.index
+
+
+# ---------------------------------------------------------------------------
+# fit_lightgbm_point / make_lightgbm_predict_fn
+# ---------------------------------------------------------------------------
+
+def test_fit_lightgbm_point_fits_and_predicts(synthetic_df):
+    matrix = features.build_feature_matrix(synthetic_df, target_col=config.LOAD_ACTUAL_COL)
+    prepared = forecast.prepare_training_frame(matrix, config.LOAD_ACTUAL_COL)
+    feature_cols = features.select_feature_columns(prepared)
+
+    fast_params = {"objective": "regression", "n_estimators": 20, "random_state": 42}
+    model = forecast.fit_lightgbm_point(
+        prepared[feature_cols], prepared[config.LOAD_ACTUAL_COL], params=fast_params
+    )
+    predictions = model.predict(prepared[feature_cols])
+    assert len(predictions) == len(prepared)
+    assert np.isfinite(predictions).all()
+
+
+def test_make_lightgbm_predict_fn_returns_series_aligned_to_forecast_df(synthetic_df):
+    matrix = features.build_feature_matrix(synthetic_df, target_col=config.LOAD_ACTUAL_COL)
+    split_at = matrix.index[len(matrix) // 2]
+    train_df = matrix[matrix.index < split_at]
+    forecast_df = matrix[
+        (matrix.index >= split_at) & (matrix.index < split_at + pd.Timedelta(hours=24))
+    ]
+
+    fast_params = {"objective": "regression", "n_estimators": 20, "random_state": 42}
+    predict_fn = forecast.make_lightgbm_predict_fn(params=fast_params)
+    predictions = predict_fn(train_df, forecast_df)
+
+    assert isinstance(predictions, pd.Series)
+    assert predictions.name == "y_lgbm"
+    assert list(predictions.index) == list(forecast_df.index)
+    assert predictions.notna().all()
+
+
+def test_rolling_origin_backtest_with_real_lightgbm_beats_dumb_constant(synthetic_df):
+    # Integration test: run the actual harness with the real LightGBM
+    # predict_fn (not a spy) over a short period of the synthetic weekly
+    # signal, and sanity-check it learned *something* — comfortably beats
+    # a model that just predicts the training mean for everything.
+    matrix = features.build_feature_matrix(synthetic_df, target_col=config.LOAD_ACTUAL_COL)
+    fast_params = {"objective": "regression", "n_estimators": 50, "random_state": 42}
+
+    result = forecast.rolling_origin_backtest(
+        matrix,
+        config.LOAD_ACTUAL_COL,
+        predict_fn=forecast.make_lightgbm_predict_fn(params=fast_params),
+        retrain_freq="MS",
+        test_start="2018-03-01",
+        test_end="2018-03-31",
+    )
+
+    assert result["y_lgbm"].notna().all()
+    lgbm_mae = (result["y_true"] - result["y_lgbm"]).abs().mean()
+
+    train_mean = matrix.loc[matrix.index < result.index.min(), config.LOAD_ACTUAL_COL].mean()
+    dumb_mae = (result["y_true"] - train_mean).abs().mean()
+
+    assert lgbm_mae < dumb_mae

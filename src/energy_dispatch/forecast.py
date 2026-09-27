@@ -1,18 +1,22 @@
 """
 Module 3 (partial) — demand forecasting: baselines, time-based splits,
-point metrics, and a model-agnostic rolling-origin backtest harness.
+point metrics, the LightGBM point model, and a model-agnostic
+rolling-origin backtest harness.
 
-LightGBM (point + quantile), interval metrics, SHAP, and the
-Diebold-Mariano test are intentionally NOT implemented yet — there's no
-learned model to evaluate until LightGBM lands, and this module is scoped
-to what's usable before that: the two parameter-free benchmarks, the
-splits, and MAE/RMSE/MAPE. rolling_origin_backtest is written to be
-model-agnostic (a pluggable predict_fn) precisely so it doesn't need to
-change when LightGBM is added later.
+The LightGBM point model (fit_lightgbm_point / make_lightgbm_predict_fn) is
+now implemented and wired into rolling_origin_backtest as its predict_fn.
+LightGBM quantile models, interval metrics, SHAP, and the Diebold-Mariano
+test remain intentionally NOT implemented yet — those need the quantile
+models specifically, not just a fitted point model, and are deferred to a
+later step. rolling_origin_backtest itself needed no changes to accept the
+new predict_fn: it was written model-agnostic from the start precisely so
+this addition wouldn't require touching the harness.
 """
 
 from __future__ import annotations
 
+import argparse
+import logging
 from collections.abc import Callable
 
 import pandas as pd
@@ -51,15 +55,61 @@ def tso_forecast(df: pd.DataFrame) -> pd.Series:
 
 
 # ---------------------------------------------------------------------------
-# LightGBM models — deferred
+# LightGBM point model
 # ---------------------------------------------------------------------------
 
-def fit_lightgbm_point(X_train: pd.DataFrame, y_train: pd.Series):
-    """Train the point-forecast LightGBM model using config.LIGHTGBM_PARAMS.
+def prepare_training_frame(
+    feature_matrix: pd.DataFrame, target_col: str = config.LOAD_ACTUAL_COL
+) -> pd.DataFrame:
+    """Rows of a built feature matrix usable for *fitting* a model: drops
+    rows flagged exclude_long_gap (data.py's marker for a gap too long to
+    interpolate, so the target itself is unreliable there) and rows with a
+    missing target value.
 
-    Deliberately not implemented yet — see module docstring.
+    Deliberately does NOT drop rows for missing *feature* values (e.g. the
+    lag_168h/rolling_168h columns are NaN for the first 168h of the whole
+    series) — LightGBM's own split logic handles NaN features natively, so
+    dropping those rows would only throw away otherwise-usable training
+    examples for no benefit.
     """
-    raise NotImplementedError("LightGBM is deferred until the forecasting setup is verified")
+    usable = pd.Series(True, index=feature_matrix.index)
+    if "exclude_long_gap" in feature_matrix.columns:
+        usable &= ~feature_matrix["exclude_long_gap"].fillna(False)
+    usable &= feature_matrix[target_col].notna()
+    return feature_matrix[usable]
+
+
+def fit_lightgbm_point(X_train: pd.DataFrame, y_train: pd.Series, params: dict | None = None):
+    """Train the point-forecast LightGBM model using config.LIGHTGBM_PARAMS
+    (or an override), returning the fitted lgb.LGBMRegressor.
+    """
+    import lightgbm as lgb
+
+    model = lgb.LGBMRegressor(**(params if params is not None else config.LIGHTGBM_PARAMS))
+    model.fit(X_train, y_train)
+    return model
+
+
+def make_lightgbm_predict_fn(
+    target_col: str = config.LOAD_ACTUAL_COL, params: dict | None = None
+) -> PredictFn:
+    """Build a predict_fn suitable for rolling_origin_backtest's predict_fn
+    argument: on every call it re-fits a fresh LightGBM model on train_df
+    (via prepare_training_frame + features.select_feature_columns) and
+    predicts on forecast_df, so each retrain block gets its own model
+    trained only on data knowable as of that block's own forecast origin.
+    """
+
+    def _predict(train_df: pd.DataFrame, forecast_df: pd.DataFrame) -> pd.Series:
+        usable_train = prepare_training_frame(train_df, target_col)
+        feature_cols = features.select_feature_columns(usable_train)
+        model = fit_lightgbm_point(
+            usable_train[feature_cols], usable_train[target_col], params=params
+        )
+        predictions = model.predict(forecast_df[feature_cols])
+        return pd.Series(predictions, index=forecast_df.index, name="y_lgbm")
+
+    return _predict
 
 
 def fit_lightgbm_quantile(X_train: pd.DataFrame, y_train: pd.Series, quantile: float):
@@ -150,14 +200,16 @@ def rolling_origin_backtest(
     If predict_fn is given, it's called once per block as
     predict_fn(train_df, forecast_df) -> pd.Series aligned to
     forecast_df.index, and the concatenated result is returned as the
-    'y_model' column. If predict_fn is None (the current state — no
-    learned model exists yet), the block iteration is skipped entirely
-    and only the two baselines are computed.
+    'y_lgbm' column (named for the LightGBM predict_fn this harness is
+    normally used with — see make_lightgbm_predict_fn — though predict_fn
+    can be any model-agnostic callable). If predict_fn is None (no model
+    supplied), the block iteration is skipped entirely and only the two
+    baselines are computed.
 
     Returns a DataFrame over the full [test_start, test_end] range with
-    columns y_true, y_naive, y_tso, y_model — y_model is always present,
+    columns y_true, y_naive, y_tso, y_lgbm — y_lgbm is always present,
     all-NA when predict_fn is None, so the table's shape doesn't change
-    once a model is plugged in later.
+    whether or not a model is plugged in.
     """
     local_date = feature_matrix.index.tz_convert(config.LOCAL_TZ).normalize()
     blocks = _retrain_block_bounds(test_start, test_end, retrain_freq)
@@ -171,7 +223,7 @@ def rolling_origin_backtest(
     result["y_true"] = feature_matrix.loc[test_index, target_col]
     result["y_naive"] = seasonal_naive_forecast(feature_matrix, target_col).loc[test_index]
     result["y_tso"] = tso_forecast(feature_matrix).loc[test_index]
-    result["y_model"] = pd.NA
+    result["y_lgbm"] = pd.NA
 
     if predict_fn is None:
         return result
@@ -196,7 +248,7 @@ def rolling_origin_backtest(
 
     if predictions:
         all_predictions = pd.concat(predictions)
-        result["y_model"] = all_predictions.reindex(test_index)
+        result["y_lgbm"] = all_predictions.reindex(test_index)
 
     return result
 
@@ -262,17 +314,106 @@ def error_breakdown(forecast_table: pd.DataFrame) -> pd.DataFrame:
 def shap_feature_importance(model, X: pd.DataFrame):
     """SHAP values for the LightGBM point model.
 
-    Deliberately not implemented yet — needs fit_lightgbm_point.
+    fit_lightgbm_point now exists, but this is still deliberately not
+    implemented yet — deferred to a later step, not blocked on anything.
     """
-    raise NotImplementedError("needs the LightGBM point model, deferred alongside it")
+    raise NotImplementedError("deferred to a later step")
 
 
 def diebold_mariano_test(errors_a: pd.Series, errors_b: pd.Series) -> dict:
     """Diebold-Mariano test for whether two models' errors differ
     significantly.
 
-    Deliberately not implemented yet — the spec uses this to compare
-    LightGBM against a benchmark, so it's deferred alongside LightGBM
-    rather than wired up against only the two baselines for now.
+    Deliberately not implemented yet — deferred to a later step, alongside
+    the quantile models.
     """
-    raise NotImplementedError("deferred alongside LightGBM")
+    raise NotImplementedError("deferred to a later step")
+
+
+# ---------------------------------------------------------------------------
+# CLI: run the real LightGBM backtest against the local processed dataset
+# ---------------------------------------------------------------------------
+
+def run_lightgbm_backtest(
+    processed_path=config.PROCESSED_HOURLY_PARQUET,
+    test_start: str = config.TEST_START,
+    test_end: str = config.TEST_END,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Load the processed hourly dataset, build the feature matrix, check
+    it for leakage, run the rolling-origin backtest with the LightGBM
+    predict_fn over [test_start, test_end], and compute point metrics for
+    all three columns (seasonal-naive, TSO, LightGBM).
+
+    Returns (forecast_table, metrics_table); does not write anything to
+    disk — see main() for that.
+    """
+    logging.info("Loading processed dataset from %s", processed_path)
+    df = pd.read_parquet(processed_path)
+
+    logging.info("Building feature matrix...")
+    matrix = features.build_feature_matrix(df, target_col=config.LOAD_ACTUAL_COL)
+    features.assert_no_leakage(matrix)
+    logging.info("Leakage check passed.")
+
+    logging.info(
+        "Running rolling-origin backtest with LightGBM over %s to %s "
+        "(this re-fits a model at every retrain block, so it can take a "
+        "while)...",
+        test_start,
+        test_end,
+    )
+    forecast_table = rolling_origin_backtest(
+        matrix,
+        config.LOAD_ACTUAL_COL,
+        predict_fn=make_lightgbm_predict_fn(),
+        test_start=test_start,
+        test_end=test_end,
+    )
+
+    metrics_table = compute_point_metrics(
+        forecast_table, model_cols=("y_naive", "y_tso", "y_lgbm")
+    )
+    return forecast_table, metrics_table
+
+
+def _build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Run the LightGBM point-forecast rolling-origin backtest against "
+            "the local processed dataset and write the forecast table and "
+            "metrics table to data/processed/."
+        )
+    )
+    parser.add_argument(
+        "--test-start",
+        default=config.TEST_START,
+        help=f"First local date of the backtest period (default: {config.TEST_START}).",
+    )
+    parser.add_argument(
+        "--test-end",
+        default=config.TEST_END,
+        help=f"Last local date of the backtest period (default: {config.TEST_END}).",
+    )
+    return parser
+
+
+def main(argv: list[str] | None = None) -> None:
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
+    args = _build_arg_parser().parse_args(argv)
+
+    forecast_table, metrics_table = run_lightgbm_backtest(
+        test_start=args.test_start, test_end=args.test_end
+    )
+
+    pd.set_option("display.float_format", "{:.2f}".format)
+    logging.info("\n%s", metrics_table)
+
+    config.FORECAST_TABLE_PARQUET.parent.mkdir(parents=True, exist_ok=True)
+    forecast_table.to_parquet(config.FORECAST_TABLE_PARQUET)
+    metrics_table.to_parquet(config.METRICS_TABLE_PARQUET)
+    logging.info("Wrote %s", config.FORECAST_TABLE_PARQUET)
+    logging.info("Wrote %s", config.METRICS_TABLE_PARQUET)
+
+
+if __name__ == "__main__":
+    main()

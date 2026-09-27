@@ -246,3 +246,55 @@ def test_assert_no_leakage_catches_wrong_origin_date(two_week_frame):
 def test_assert_no_leakage_requires_origin_column(two_week_frame):
     with pytest.raises(AssertionError, match="origin_utc"):
         features.assert_no_leakage(two_week_frame)
+
+
+# ---------------------------------------------------------------------------
+# select_feature_columns
+# ---------------------------------------------------------------------------
+
+def test_select_feature_columns_excludes_target_and_bookkeeping(two_week_frame):
+    matrix = features.build_feature_matrix(two_week_frame, target_col=config.LOAD_ACTUAL_COL)
+    selected = features.select_feature_columns(matrix)
+
+    assert config.LOAD_ACTUAL_COL not in selected
+    assert "origin_utc" not in selected
+    # sanity: real engineered features are still present
+    assert "hour" in selected
+    assert "lag_24h" in selected
+    assert "rolling_mean_24h" in selected
+    assert "heating_degree_hours" in selected
+
+
+def test_select_feature_columns_excludes_qc_flags_and_non_target_load_columns():
+    idx = pd.date_range("2019-06-01", periods=24 * 14, freq="h", tz="Europe/Madrid").tz_convert(
+        "UTC"
+    )
+    df = pd.DataFrame(
+        {
+            config.LOAD_ACTUAL_COL: np.arange(len(idx), dtype=float),
+            config.LOAD_FORECAST_COL: 0.0,
+            config.SOLAR_GEN_COL: 0.0,
+            config.WIND_GEN_COL: 0.0,
+            config.WEATHER_TEMPERATURE_COL: 20.0,
+            "is_duplicate_timestamp": False,
+            "is_missing_hour": False,
+            "is_implausible_load": False,
+            "is_spike": False,
+            "exclude_long_gap": False,
+        },
+        index=idx,
+    )
+    matrix = features.build_feature_matrix(df, target_col=config.LOAD_ACTUAL_COL)
+    selected = features.select_feature_columns(matrix)
+
+    for excluded_col in (
+        config.LOAD_FORECAST_COL,
+        config.SOLAR_GEN_COL,
+        config.WIND_GEN_COL,
+        "is_duplicate_timestamp",
+        "is_missing_hour",
+        "is_implausible_load",
+        "is_spike",
+        "exclude_long_gap",
+    ):
+        assert excluded_col not in selected
