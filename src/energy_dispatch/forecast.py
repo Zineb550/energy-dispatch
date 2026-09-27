@@ -1,16 +1,19 @@
 """
 Module 3 (partial) — demand forecasting: baselines, time-based splits,
-point metrics, the LightGBM point model, and a model-agnostic
-rolling-origin backtest harness.
+point metrics, the LightGBM point and quantile models, and a
+model-agnostic rolling-origin backtest harness.
 
-The LightGBM point model (fit_lightgbm_point / make_lightgbm_predict_fn) is
-now implemented and wired into rolling_origin_backtest as its predict_fn.
-LightGBM quantile models, interval metrics, SHAP, and the Diebold-Mariano
-test remain intentionally NOT implemented yet — those need the quantile
-models specifically, not just a fitted point model, and are deferred to a
-later step. rolling_origin_backtest itself needed no changes to accept the
-new predict_fn: it was written model-agnostic from the start precisely so
-this addition wouldn't require touching the harness.
+The LightGBM point model (fit_lightgbm_point / make_lightgbm_predict_fn)
+and the LightGBM quantile models (fit_lightgbm_quantile /
+make_lightgbm_quantile_predict_fn / run_quantile_backtests) are both now
+implemented, along with compute_interval_metrics (coverage + pinball
+loss). SHAP and the Diebold-Mariano test remain intentionally NOT
+implemented yet — deferred to a later step. rolling_origin_backtest
+gained one small, backward-compatible addition to support this
+(output_col, defaulting to "y_lgbm") rather than a new harness: the same
+block-iteration logic that fits/predicts the point model also fits/
+predicts each quantile model, just writing its predictions to a
+differently-named column.
 """
 
 from __future__ import annotations
@@ -19,6 +22,7 @@ import argparse
 import logging
 from collections.abc import Callable
 
+import numpy as np
 import pandas as pd
 
 from energy_dispatch import config, features
@@ -112,12 +116,49 @@ def make_lightgbm_predict_fn(
     return _predict
 
 
-def fit_lightgbm_quantile(X_train: pd.DataFrame, y_train: pd.Series, quantile: float):
-    """Train a single quantile LightGBM model (config.QUANTILE_LOW / HIGH).
+def fit_lightgbm_quantile(
+    X_train: pd.DataFrame, y_train: pd.Series, quantile: float, params: dict | None = None
+):
+    """Train a single quantile LightGBM model (typically config.QUANTILE_LOW
+    or config.QUANTILE_HIGH) using config.LIGHTGBM_QUANTILE_PARAMS (or an
+    override) plus the requested quantile's alpha, returning the fitted
+    lgb.LGBMRegressor.
 
-    Deliberately not implemented yet — see module docstring.
+    A separate model per quantile (rather than one multi-output model) is
+    the standard approach for gradient-boosted quantile regression: each
+    call trains against the pinball loss for its own alpha.
     """
-    raise NotImplementedError("LightGBM is deferred until the forecasting setup is verified")
+    import lightgbm as lgb
+
+    base_params = dict(params if params is not None else config.LIGHTGBM_QUANTILE_PARAMS)
+    base_params["alpha"] = quantile
+    model = lgb.LGBMRegressor(**base_params)
+    model.fit(X_train, y_train)
+    return model
+
+
+def make_lightgbm_quantile_predict_fn(
+    quantile: float, target_col: str = config.LOAD_ACTUAL_COL, params: dict | None = None
+) -> PredictFn:
+    """Build a predict_fn (suitable for rolling_origin_backtest) for a
+    single quantile model. Mirrors make_lightgbm_predict_fn exactly, but
+    fits fit_lightgbm_quantile(..., quantile) instead of the point model.
+    The returned Series is named q{int(quantile * 100)}, e.g. "q10" for
+    quantile=0.10 — pass that as rolling_origin_backtest's output_col so
+    it lands in a column of the same name rather than overwriting "y_lgbm".
+    """
+
+    def _predict(train_df: pd.DataFrame, forecast_df: pd.DataFrame) -> pd.Series:
+        usable_train = prepare_training_frame(train_df, target_col)
+        feature_cols = features.select_feature_columns(usable_train)
+        model = fit_lightgbm_quantile(
+            usable_train[feature_cols], usable_train[target_col], quantile, params=params
+        )
+        predictions = model.predict(forecast_df[feature_cols])
+        col_name = f"q{int(round(quantile * 100))}"
+        return pd.Series(predictions, index=forecast_df.index, name=col_name)
+
+    return _predict
 
 
 # ---------------------------------------------------------------------------
@@ -183,6 +224,7 @@ def rolling_origin_backtest(
     feature_matrix: pd.DataFrame,
     target_col: str,
     predict_fn: PredictFn | None = None,
+    output_col: str = "y_lgbm",
     retrain_freq: str = config.BACKTEST_RETRAIN_FREQ,
     test_start: str = config.TEST_START,
     test_end: str = config.TEST_END,
@@ -200,16 +242,19 @@ def rolling_origin_backtest(
     If predict_fn is given, it's called once per block as
     predict_fn(train_df, forecast_df) -> pd.Series aligned to
     forecast_df.index, and the concatenated result is returned as the
-    'y_lgbm' column (named for the LightGBM predict_fn this harness is
-    normally used with — see make_lightgbm_predict_fn — though predict_fn
-    can be any model-agnostic callable). If predict_fn is None (no model
+    output_col column. output_col defaults to "y_lgbm" (the LightGBM point
+    model this harness is normally used with — see make_lightgbm_predict_fn)
+    but is overridable so the exact same harness can also run a quantile
+    model into its own column (e.g. output_col="q10" with
+    make_lightgbm_quantile_predict_fn — see run_quantile_backtests), or any
+    other model-agnostic predict_fn. If predict_fn is None (no model
     supplied), the block iteration is skipped entirely and only the two
     baselines are computed.
 
     Returns a DataFrame over the full [test_start, test_end] range with
-    columns y_true, y_naive, y_tso, y_lgbm — y_lgbm is always present,
-    all-NA when predict_fn is None, so the table's shape doesn't change
-    whether or not a model is plugged in.
+    columns y_true, y_naive, y_tso, <output_col> — output_col is always
+    present, all-NA when predict_fn is None, so the table's shape doesn't
+    change whether or not a model is plugged in.
     """
     local_date = feature_matrix.index.tz_convert(config.LOCAL_TZ).normalize()
     blocks = _retrain_block_bounds(test_start, test_end, retrain_freq)
@@ -223,7 +268,7 @@ def rolling_origin_backtest(
     result["y_true"] = feature_matrix.loc[test_index, target_col]
     result["y_naive"] = seasonal_naive_forecast(feature_matrix, target_col).loc[test_index]
     result["y_tso"] = tso_forecast(feature_matrix).loc[test_index]
-    result["y_lgbm"] = pd.NA
+    result[output_col] = pd.NA
 
     if predict_fn is None:
         return result
@@ -248,9 +293,45 @@ def rolling_origin_backtest(
 
     if predictions:
         all_predictions = pd.concat(predictions)
-        result["y_lgbm"] = all_predictions.reindex(test_index)
+        result[output_col] = all_predictions.reindex(test_index)
 
     return result
+
+
+def run_quantile_backtests(
+    feature_matrix: pd.DataFrame,
+    target_col: str = config.LOAD_ACTUAL_COL,
+    quantiles: tuple[float, ...] = (config.QUANTILE_LOW, config.QUANTILE_HIGH),
+    params: dict | None = None,
+    retrain_freq: str = config.BACKTEST_RETRAIN_FREQ,
+    test_start: str = config.TEST_START,
+    test_end: str = config.TEST_END,
+) -> pd.DataFrame:
+    """Run rolling_origin_backtest once per quantile in `quantiles`, each
+    fitting its own LightGBM quantile model per retrain block (via
+    make_lightgbm_quantile_predict_fn), and combine the results into a
+    single table: y_true, y_naive, y_tso (identical across every quantile
+    run, since those don't depend on predict_fn, so taken from the first
+    run), plus one column per quantile named q{int(q * 100)} (e.g. "q10",
+    "q90" for the default config.QUANTILE_LOW/HIGH).
+    """
+    combined: pd.DataFrame | None = None
+    for q in quantiles:
+        col = f"q{int(round(q * 100))}"
+        table = rolling_origin_backtest(
+            feature_matrix,
+            target_col,
+            predict_fn=make_lightgbm_quantile_predict_fn(q, target_col=target_col, params=params),
+            output_col=col,
+            retrain_freq=retrain_freq,
+            test_start=test_start,
+            test_end=test_end,
+        )
+        if combined is None:
+            combined = table[["y_true", "y_naive", "y_tso"]].copy()
+        combined[col] = table[col]
+
+    return combined
 
 
 # ---------------------------------------------------------------------------
@@ -288,16 +369,73 @@ def compute_point_metrics(
     return pd.DataFrame(rows).set_index("model")
 
 
-# ---------------------------------------------------------------------------
-# Everything below needs a fitted model — deferred alongside LightGBM
-# ---------------------------------------------------------------------------
+def compute_interval_metrics(
+    forecast_table: pd.DataFrame,
+    low_col: str = "q10",
+    high_col: str = "q90",
+    true_col: str = "y_true",
+    target_coverage: float = config.PREDICTION_INTERVAL_COVERAGE_TARGET,
+) -> dict:
+    """Coverage and pinball loss for a [low_col, high_col] prediction
+    interval against true_col.
 
-def compute_interval_metrics(forecast_table: pd.DataFrame) -> dict:
-    """Coverage and pinball loss for the quantile models.
+    - coverage: the empirical fraction of rows where true_col actually
+      falls within [low_col, high_col] — compare this against
+      target_coverage (0.80 for the default 10th/90th percentile
+      interval) to see whether the interval is well-calibrated,
+      too narrow (coverage < target), or too wide (coverage > target).
+    - avg_interval_width: mean(high_col - low_col), reported alongside
+      coverage since a trivially wide interval can hit any coverage
+      target without being useful.
+    - pinball_loss_low / pinball_loss_high: the quantile (pinball) loss
+      for each side's own quantile (config.QUANTILE_LOW/HIGH), the
+      proper scoring rule each underlying LightGBM quantile model is
+      actually trained against — lower is better, 0 is a perfect fit.
 
-    Deliberately not implemented yet — needs fit_lightgbm_quantile.
+    Rows with a missing true/low/high value are dropped (n reports how
+    many rows the metrics were computed over).
     """
-    raise NotImplementedError("needs the quantile models, deferred alongside LightGBM")
+    valid = (
+        forecast_table[true_col].notna()
+        & forecast_table[low_col].notna()
+        & forecast_table[high_col].notna()
+    )
+    n = int(valid.sum())
+    if n == 0:
+        nan = float("nan")
+        return {
+            "coverage": nan,
+            "target_coverage": target_coverage,
+            "avg_interval_width": nan,
+            "pinball_loss_low": nan,
+            "pinball_loss_high": nan,
+            "n": 0,
+        }
+
+    y_true = forecast_table.loc[valid, true_col]
+    y_low = forecast_table.loc[valid, low_col]
+    y_high = forecast_table.loc[valid, high_col]
+
+    coverage = float(((y_true >= y_low) & (y_true <= y_high)).mean())
+    avg_width = float((y_high - y_low).mean())
+
+    def _pinball_loss(y_true: pd.Series, y_pred: pd.Series, tau: float) -> float:
+        diff = y_true - y_pred
+        return float(np.maximum(tau * diff, (tau - 1) * diff).mean())
+
+    return {
+        "coverage": coverage,
+        "target_coverage": target_coverage,
+        "avg_interval_width": avg_width,
+        "pinball_loss_low": _pinball_loss(y_true, y_low, config.QUANTILE_LOW),
+        "pinball_loss_high": _pinball_loss(y_true, y_high, config.QUANTILE_HIGH),
+        "n": n,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Everything below is still deferred (unrelated to the quantile models)
+# ---------------------------------------------------------------------------
 
 
 def error_breakdown(forecast_table: pd.DataFrame) -> pd.DataFrame:
@@ -334,18 +472,24 @@ def diebold_mariano_test(errors_a: pd.Series, errors_b: pd.Series) -> dict:
 # CLI: run the real LightGBM backtest against the local processed dataset
 # ---------------------------------------------------------------------------
 
-def run_lightgbm_backtest(
+def run_full_backtest(
     processed_path=config.PROCESSED_HOURLY_PARQUET,
     test_start: str = config.TEST_START,
     test_end: str = config.TEST_END,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
+    skip_quantiles: bool = False,
+) -> tuple[pd.DataFrame, pd.DataFrame, dict | None]:
     """Load the processed hourly dataset, build the feature matrix, check
-    it for leakage, run the rolling-origin backtest with the LightGBM
-    predict_fn over [test_start, test_end], and compute point metrics for
-    all three columns (seasonal-naive, TSO, LightGBM).
+    it for leakage, run the rolling-origin backtest with the LightGBM point
+    model over [test_start, test_end], and (unless skip_quantiles) also run
+    it once per quantile in config.QUANTILE_LOW/HIGH, merging their columns
+    (q10, q90 by default) into the same forecast table. Computes point
+    metrics for all three point-forecast columns (seasonal-naive, TSO,
+    LightGBM) and, when the quantile columns are present, interval metrics
+    for them too.
 
-    Returns (forecast_table, metrics_table); does not write anything to
-    disk — see main() for that.
+    Returns (forecast_table, metrics_table, interval_metrics) —
+    interval_metrics is None when skip_quantiles is True. Does not write
+    anything to disk — see main() for that.
     """
     logging.info("Loading processed dataset from %s", processed_path)
     df = pd.read_parquet(processed_path)
@@ -356,9 +500,9 @@ def run_lightgbm_backtest(
     logging.info("Leakage check passed.")
 
     logging.info(
-        "Running rolling-origin backtest with LightGBM over %s to %s "
-        "(this re-fits a model at every retrain block, so it can take a "
-        "while)...",
+        "Running rolling-origin backtest with the LightGBM point model over "
+        "%s to %s (this re-fits a model at every retrain block, so it can "
+        "take a while)...",
         test_start,
         test_end,
     )
@@ -370,18 +514,33 @@ def run_lightgbm_backtest(
         test_end=test_end,
     )
 
+    interval_metrics = None
+    if not skip_quantiles:
+        logging.info(
+            "Running rolling-origin backtest with the LightGBM quantile "
+            "models (one retrain-per-block fit per quantile, so this "
+            "roughly doubles the runtime for the default 2 quantiles)..."
+        )
+        quantile_table = run_quantile_backtests(
+            matrix, config.LOAD_ACTUAL_COL, test_start=test_start, test_end=test_end
+        )
+        for col in quantile_table.columns:
+            if col not in ("y_true", "y_naive", "y_tso"):
+                forecast_table[col] = quantile_table[col]
+        interval_metrics = compute_interval_metrics(forecast_table)
+
     metrics_table = compute_point_metrics(
         forecast_table, model_cols=("y_naive", "y_tso", "y_lgbm")
     )
-    return forecast_table, metrics_table
+    return forecast_table, metrics_table, interval_metrics
 
 
 def _build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Run the LightGBM point-forecast rolling-origin backtest against "
-            "the local processed dataset and write the forecast table and "
-            "metrics table to data/processed/."
+            "Run the LightGBM point + quantile rolling-origin backtest "
+            "against the local processed dataset and write the forecast "
+            "table and metrics table to data/processed/."
         )
     )
     parser.add_argument(
@@ -394,6 +553,12 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         default=config.TEST_END,
         help=f"Last local date of the backtest period (default: {config.TEST_END}).",
     )
+    parser.add_argument(
+        "--skip-quantiles",
+        action="store_true",
+        help="Only run the LightGBM point model (skip the q10/q90 quantile "
+        "backtests, roughly halving the runtime).",
+    )
     return parser
 
 
@@ -401,12 +566,14 @@ def main(argv: list[str] | None = None) -> None:
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     args = _build_arg_parser().parse_args(argv)
 
-    forecast_table, metrics_table = run_lightgbm_backtest(
-        test_start=args.test_start, test_end=args.test_end
+    forecast_table, metrics_table, interval_metrics = run_full_backtest(
+        test_start=args.test_start, test_end=args.test_end, skip_quantiles=args.skip_quantiles
     )
 
     pd.set_option("display.float_format", "{:.2f}".format)
     logging.info("\n%s", metrics_table)
+    if interval_metrics is not None:
+        logging.info("\nInterval metrics (q10/q90):\n%s", interval_metrics)
 
     config.FORECAST_TABLE_PARQUET.parent.mkdir(parents=True, exist_ok=True)
     forecast_table.to_parquet(config.FORECAST_TABLE_PARQUET)

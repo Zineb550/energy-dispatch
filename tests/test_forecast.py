@@ -1,8 +1,7 @@
 """
 Tests for energy_dispatch.forecast — baselines, time-based splits, point
-metrics, the LightGBM point model, and the rolling-origin backtest
-harness. LightGBM quantile models remain intentionally not implemented
-yet and are not tested here.
+and interval metrics, the LightGBM point and quantile models, and the
+rolling-origin backtest harness.
 """
 
 from __future__ import annotations
@@ -306,3 +305,125 @@ def test_rolling_origin_backtest_with_real_lightgbm_beats_dumb_constant(syntheti
     dumb_mae = (result["y_true"] - train_mean).abs().mean()
 
     assert lgbm_mae < dumb_mae
+
+
+# ---------------------------------------------------------------------------
+# rolling_origin_backtest — output_col
+# ---------------------------------------------------------------------------
+
+def test_rolling_origin_backtest_output_col_is_overridable(synthetic_df):
+    matrix = features.build_feature_matrix(synthetic_df, target_col=config.LOAD_ACTUAL_COL)
+    result = forecast.rolling_origin_backtest(
+        matrix,
+        config.LOAD_ACTUAL_COL,
+        predict_fn=lambda train_df, forecast_df: pd.Series(0.0, index=forecast_df.index),
+        output_col="q10",
+        retrain_freq="MS",
+        test_start="2018-01-01",
+        test_end="2018-01-31",
+    )
+    assert "q10" in result.columns
+    assert "y_lgbm" not in result.columns
+    assert (result["q10"] == 0.0).all()
+
+
+# ---------------------------------------------------------------------------
+# fit_lightgbm_quantile / make_lightgbm_quantile_predict_fn
+# ---------------------------------------------------------------------------
+
+def test_fit_lightgbm_quantile_fits_and_predicts(synthetic_df):
+    matrix = features.build_feature_matrix(synthetic_df, target_col=config.LOAD_ACTUAL_COL)
+    prepared = forecast.prepare_training_frame(matrix, config.LOAD_ACTUAL_COL)
+    feature_cols = features.select_feature_columns(prepared)
+
+    fast_params = {"objective": "quantile", "n_estimators": 20, "random_state": 42}
+    model = forecast.fit_lightgbm_quantile(
+        prepared[feature_cols], prepared[config.LOAD_ACTUAL_COL], quantile=0.1, params=fast_params
+    )
+    predictions = model.predict(prepared[feature_cols])
+    assert len(predictions) == len(prepared)
+    assert np.isfinite(predictions).all()
+
+
+def test_low_quantile_predicts_below_high_quantile_on_average(synthetic_df):
+    # Not a pointwise guarantee (LightGBM's separately-trained quantile
+    # models have no built-in monotonicity constraint), but on a smooth
+    # synthetic signal with plenty of training data, q90's average
+    # prediction should clear q10's average prediction comfortably.
+    matrix = features.build_feature_matrix(synthetic_df, target_col=config.LOAD_ACTUAL_COL)
+    split_at = matrix.index[len(matrix) // 2]
+    train_df = matrix[matrix.index < split_at]
+    forecast_df = matrix[
+        (matrix.index >= split_at) & (matrix.index < split_at + pd.Timedelta(hours=48))
+    ]
+
+    fast_params = {"objective": "quantile", "n_estimators": 50, "random_state": 42}
+    low_fn = forecast.make_lightgbm_quantile_predict_fn(0.10, params=fast_params)
+    high_fn = forecast.make_lightgbm_quantile_predict_fn(0.90, params=fast_params)
+    low_predictions = low_fn(train_df, forecast_df)
+    high_predictions = high_fn(train_df, forecast_df)
+
+    assert low_predictions.name == "q10"
+    assert high_predictions.name == "q90"
+    assert high_predictions.mean() > low_predictions.mean()
+
+
+def test_run_quantile_backtests_returns_expected_columns(synthetic_df):
+    matrix = features.build_feature_matrix(synthetic_df, target_col=config.LOAD_ACTUAL_COL)
+    fast_params = {"objective": "quantile", "n_estimators": 20, "random_state": 42}
+
+    result = forecast.run_quantile_backtests(
+        matrix,
+        config.LOAD_ACTUAL_COL,
+        params=fast_params,
+        retrain_freq="MS",
+        test_start="2018-03-01",
+        test_end="2018-03-31",
+    )
+
+    assert set(result.columns) == {"y_true", "y_naive", "y_tso", "q10", "q90"}
+    assert result["q10"].notna().all()
+    assert result["q90"].notna().all()
+
+
+# ---------------------------------------------------------------------------
+# compute_interval_metrics
+# ---------------------------------------------------------------------------
+
+def test_compute_interval_metrics_hand_computed():
+    table = pd.DataFrame(
+        {
+            "y_true": [100.0, 200.0, 300.0, 1000.0],  # last row: true value outside the interval
+            "q10": [90.0, 180.0, 250.0, 100.0],
+            "q90": [110.0, 220.0, 350.0, 200.0],
+        }
+    )
+    metrics = forecast.compute_interval_metrics(table, target_coverage=0.80)
+
+    assert metrics["n"] == 4
+    assert metrics["coverage"] == 0.75  # 3 of 4 rows covered
+    assert metrics["target_coverage"] == 0.80
+    expected_width = ((110 - 90) + (220 - 180) + (350 - 250) + (200 - 100)) / 4
+    assert np.isclose(metrics["avg_interval_width"], expected_width)
+    assert metrics["pinball_loss_low"] > 0  # q10 misses on the last (uncovered) row
+    assert metrics["pinball_loss_high"] > 0
+
+
+def test_compute_interval_metrics_perfect_coverage_has_zero_pinball_loss_at_the_bounds():
+    # If the true value always sits exactly on the bound being scored, the
+    # pinball loss for that side is exactly 0 (the loss function's minimum).
+    table = pd.DataFrame({"y_true": [100.0, 200.0], "q10": [100.0, 200.0], "q90": [150.0, 250.0]})
+    metrics = forecast.compute_interval_metrics(table)
+    assert np.isclose(metrics["pinball_loss_low"], 0.0)
+
+
+def test_compute_interval_metrics_drops_rows_with_missing_values():
+    table = pd.DataFrame(
+        {
+            "y_true": [100.0, np.nan, 300.0],
+            "q10": [90.0, 180.0, 250.0],
+            "q90": [110.0, 220.0, 350.0],
+        }
+    )
+    metrics = forecast.compute_interval_metrics(table)
+    assert metrics["n"] == 2
