@@ -1,0 +1,45 @@
+[project]
+name = "energy-dispatch"
+version = "0.1.0"
+description = "Day-ahead electricity demand forecasting + battery dispatch optimization (Spain, OPSD data)"
+requires-python = ">=3.11"
+readme = "README.md"
+
+dependencies = [
+    "pandas>=2.1",
+    "numpy>=1.26",
+    "pyarrow>=14.0",
+    "scikit-learn>=1.4",
+    "lightgbm>=4.3",
+    "statsmodels>=0.14",
+    "shap>=0.44",
+    "holidays>=0.45",
+    "pulp>=2.8",
+    "matplotlib>=3.8",
+    "plotly>=5.18",
+    "streamlit>=1.32",
+    "requests>=2.31",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.3",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
