@@ -1,19 +1,38 @@
 """
 Module 3 (partial) — demand forecasting: baselines, time-based splits,
-point metrics, the LightGBM point and quantile models, and a
-model-agnostic rolling-origin backtest harness.
+point metrics, the LightGBM point and quantile models, split-conformal
+interval calibration, and a model-agnostic rolling-origin backtest
+harness.
 
 The LightGBM point model (fit_lightgbm_point / make_lightgbm_predict_fn)
 and the LightGBM quantile models (fit_lightgbm_quantile /
-make_lightgbm_quantile_predict_fn / run_quantile_backtests) are both now
+make_lightgbm_quantile_predict_fn / run_quantile_backtests) are both
 implemented, along with compute_interval_metrics (coverage + pinball
 loss). SHAP and the Diebold-Mariano test remain intentionally NOT
-implemented yet — deferred to a later step. rolling_origin_backtest
-gained one small, backward-compatible addition to support this
-(output_col, defaulting to "y_lgbm") rather than a new harness: the same
-block-iteration logic that fits/predicts the point model also fits/
-predicts each quantile model, just writing its predictions to a
-differently-named column.
+implemented yet — deferred to a later step.
+
+A real backtest showed the raw (uncalibrated) quantile models badly
+under-covering their target interval (56% empirical vs. an 80% target,
+even after a hyperparameter sweep -- see QUANTILE_PARAM_SWEEP_GRID below,
+which plateaued around 69%). make_conformalized_quantile_predict_fn /
+run_conformal_quantile_backtest implement split-conformal calibration
+(CQR -- Romano, Patterson & Candès, 2019) to fix this properly: each
+retrain block holds out a calibration slice of its own training data,
+measures how far off the raw q10/q90 predictions actually are on it
+(out-of-sample), and widens the interval by that measured amount. This is
+now the default path for the quantile columns in run_full_backtest / the
+CLI; run_quantile_backtests (the uncalibrated version) is kept for
+comparison/diagnostic use (e.g. the sweep).
+
+rolling_origin_backtest gained two small, backward-compatible additions
+to support all of this rather than growing a second harness: (1)
+output_col (default "y_lgbm") lets the same block-iteration logic write a
+single model's predictions to a differently-named column (used by each
+independent quantile model); (2) predict_fn may return either a Series
+(the single-output_col case above) or a DataFrame with its own named
+columns (used by the conformal predict_fn, whose q10 and q90 outputs are
+coupled by a shared calibration split and so must come from one call, not
+two).
 """
 
 from __future__ import annotations
@@ -161,6 +180,122 @@ def make_lightgbm_quantile_predict_fn(
     return _predict
 
 
+def _conformal_quantile_correction(scores: np.ndarray, target_coverage: float) -> float:
+    """The split-conformal (CQR) width correction Q_hat: the
+    ceil((n + 1) * target_coverage) / n empirical quantile of the
+    calibration nonconformity scores (n = len(scores)), capped at a level
+    of 1.0. Using n + 1 rather than n, and rounding the count up before
+    dividing, is what gives split-conformal prediction its finite-sample
+    coverage guarantee rather than only an asymptotic one.
+
+    Q_hat can be negative: if the raw model already over-covers on the
+    calibration slice (most scores negative, meaning the true value fell
+    well inside the raw interval), the correction narrows the interval
+    rather than widening it — split-conformal calibration targets the
+    correct coverage either way, it isn't a one-directional "always make
+    it wider" heuristic.
+    """
+    n = len(scores)
+    level = min(1.0, np.ceil((n + 1) * target_coverage) / n)
+    return float(np.quantile(scores, level))
+
+
+def make_conformalized_quantile_predict_fn(
+    quantiles: tuple[float, float] = (config.QUANTILE_LOW, config.QUANTILE_HIGH),
+    target_col: str = config.LOAD_ACTUAL_COL,
+    params: dict | None = None,
+    calibration_frac: float = config.CONFORMAL_CALIBRATION_FRAC,
+    target_coverage: float = config.PREDICTION_INTERVAL_COVERAGE_TARGET,
+) -> PredictFn:
+    """Build a predict_fn (suitable for rolling_origin_backtest) that
+    fits BOTH quantile models per block and corrects their raw predictions
+    with split-conformal calibration (CQR -- Romano, Patterson & Candès,
+    2019), so the resulting interval targets target_coverage rather than
+    whatever the uncalibrated models happen to produce (see the module
+    docstring for why a real backtest needed this).
+
+    Per call (i.e. per retrain block):
+      1. train_df's usable rows are split chronologically by forecast
+         origin into a "fit" slice (the earlier 1 - calibration_frac of
+         distinct origins) and a held-out "calibration" slice (the most
+         recent calibration_frac of distinct origins). Splitting by
+         distinct origin, not row count, keeps every row of a given
+         target day together on one side (they all share one origin by
+         construction -- see features.compute_forecast_origin), and the
+         calibration slice being the most recent, still-in-the-past
+         origins keeps the split leakage-safe: every row in it still has
+         origin_utc < this block's own origin.
+      2. Both quantile models are fit on the fit slice only.
+      3. They predict on the calibration slice -- genuinely out-of-sample,
+         since it was excluded from step 2 -- giving raw q_low/q_high
+         there. The nonconformity score for each calibration row is
+         max(q_low_pred - y, y - q_high_pred): how far the true value
+         fell outside the raw interval (negative if it fell inside).
+      4. Q_hat is the ceil((n + 1) * target_coverage) / n empirical
+         quantile of those scores -- the standard finite-sample conformal
+         correction (using n+1 rather than n, and rounding up, is what
+         gives the method its finite-sample coverage guarantee, not just
+         an asymptotic one).
+      5. The block's actual forecast_df predictions are widened by Q_hat
+         on each side: q_low_final = q_low_raw - Q_hat, q_high_final =
+         q_high_raw + Q_hat.
+
+    Returns a pd.DataFrame (not a Series, unlike the other predict_fns
+    here) with columns q{int(quantiles[0] * 100)}, q{int(quantiles[1] *
+    100)} (e.g. "q10", "q90") -- rolling_origin_backtest merges a
+    DataFrame result's columns in under their own names. A DataFrame,
+    rather than two separate predict_fn calls (one per quantile, as
+    make_lightgbm_quantile_predict_fn does), is required here because the
+    calibration split and the nonconformity scores couple q_low and
+    q_high together -- computing them independently per quantile would
+    mean two different calibration splits computed at two different
+    times, which would undermine the correction.
+    """
+    q_low, q_high = quantiles
+    low_col = f"q{int(round(q_low * 100))}"
+    high_col = f"q{int(round(q_high * 100))}"
+
+    def _predict(train_df: pd.DataFrame, forecast_df: pd.DataFrame) -> pd.DataFrame:
+        usable_train = prepare_training_frame(train_df, target_col)
+        feature_cols = features.select_feature_columns(usable_train)
+
+        unique_origins = np.sort(usable_train["origin_utc"].unique())
+        if len(unique_origins) < 2:
+            raise ValueError(
+                "not enough distinct forecast origins in train_df to hold out a "
+                "conformal calibration slice"
+            )
+        cutoff_idx = int(round(len(unique_origins) * (1 - calibration_frac)))
+        cutoff_idx = max(1, min(cutoff_idx, len(unique_origins) - 1))
+        calib_cutoff = unique_origins[cutoff_idx]
+
+        fit_df = usable_train[usable_train["origin_utc"] < calib_cutoff]
+        calib_df = usable_train[usable_train["origin_utc"] >= calib_cutoff]
+
+        low_model = fit_lightgbm_quantile(
+            fit_df[feature_cols], fit_df[target_col], q_low, params=params
+        )
+        high_model = fit_lightgbm_quantile(
+            fit_df[feature_cols], fit_df[target_col], q_high, params=params
+        )
+
+        calib_low_pred = low_model.predict(calib_df[feature_cols])
+        calib_high_pred = high_model.predict(calib_df[feature_cols])
+        calib_y = calib_df[target_col].to_numpy()
+        scores = np.maximum(calib_low_pred - calib_y, calib_y - calib_high_pred)
+        q_hat = _conformal_quantile_correction(scores, target_coverage)
+
+        raw_low = low_model.predict(forecast_df[feature_cols])
+        raw_high = high_model.predict(forecast_df[feature_cols])
+
+        return pd.DataFrame(
+            {low_col: raw_low - q_hat, high_col: raw_high + q_hat},
+            index=forecast_df.index,
+        )
+
+    return _predict
+
+
 # ---------------------------------------------------------------------------
 # Time-based splits
 # ---------------------------------------------------------------------------
@@ -196,7 +331,7 @@ def time_based_split(df: pd.DataFrame) -> dict[str, pd.DataFrame]:
 # Rolling-origin backtest (model-agnostic)
 # ---------------------------------------------------------------------------
 
-PredictFn = Callable[[pd.DataFrame, pd.DataFrame], pd.Series]
+PredictFn = Callable[[pd.DataFrame, pd.DataFrame], pd.Series | pd.DataFrame]
 
 
 def _retrain_block_bounds(
@@ -240,21 +375,30 @@ def rolling_origin_backtest(
         falls in [block_start, block_end).
 
     If predict_fn is given, it's called once per block as
-    predict_fn(train_df, forecast_df) -> pd.Series aligned to
-    forecast_df.index, and the concatenated result is returned as the
-    output_col column. output_col defaults to "y_lgbm" (the LightGBM point
-    model this harness is normally used with — see make_lightgbm_predict_fn)
-    but is overridable so the exact same harness can also run a quantile
-    model into its own column (e.g. output_col="q10" with
-    make_lightgbm_quantile_predict_fn — see run_quantile_backtests), or any
-    other model-agnostic predict_fn. If predict_fn is None (no model
-    supplied), the block iteration is skipped entirely and only the two
-    baselines are computed.
+    predict_fn(train_df, forecast_df) and may return either:
+
+      - a pd.Series aligned to forecast_df.index: the concatenated result
+        is written to the output_col column. output_col defaults to
+        "y_lgbm" (the LightGBM point model this harness is normally used
+        with — see make_lightgbm_predict_fn) but is overridable so the
+        exact same harness can also run a single quantile model into its
+        own column (e.g. output_col="q10" with
+        make_lightgbm_quantile_predict_fn — see run_quantile_backtests).
+      - a pd.DataFrame aligned to forecast_df.index with its own named
+        column(s): each column is written to the result table under that
+        same name instead of output_col (whose placeholder is dropped),
+        e.g. make_conformalized_quantile_predict_fn returning both "q10"
+        and "q90" from one call, because its calibration step couples
+        them and can't be split across two separate predict_fn calls.
+
+    If predict_fn is None (no model supplied), the block iteration is
+    skipped entirely and only the two baselines are computed.
 
     Returns a DataFrame over the full [test_start, test_end] range with
-    columns y_true, y_naive, y_tso, <output_col> — output_col is always
-    present, all-NA when predict_fn is None, so the table's shape doesn't
-    change whether or not a model is plugged in.
+    columns y_true, y_naive, y_tso, plus whatever predict_fn contributes
+    (output_col, all-NA, when predict_fn is None or returns a Series; the
+    DataFrame's own columns when it returns a DataFrame) — so the table's
+    shape is predictable whether or not a model is plugged in.
     """
     local_date = feature_matrix.index.tz_convert(config.LOCAL_TZ).normalize()
     blocks = _retrain_block_bounds(test_start, test_end, retrain_freq)
@@ -293,9 +437,54 @@ def rolling_origin_backtest(
 
     if predictions:
         all_predictions = pd.concat(predictions)
-        result[output_col] = all_predictions.reindex(test_index)
+        if isinstance(all_predictions, pd.DataFrame):
+            result = result.drop(columns=[output_col])
+            for col in all_predictions.columns:
+                result[col] = all_predictions[col].reindex(test_index)
+        else:
+            result[output_col] = all_predictions.reindex(test_index)
 
     return result
+
+
+def run_conformal_quantile_backtest(
+    feature_matrix: pd.DataFrame,
+    target_col: str = config.LOAD_ACTUAL_COL,
+    quantiles: tuple[float, float] = (config.QUANTILE_LOW, config.QUANTILE_HIGH),
+    params: dict | None = None,
+    calibration_frac: float = config.CONFORMAL_CALIBRATION_FRAC,
+    retrain_freq: str = config.BACKTEST_RETRAIN_FREQ,
+    test_start: str = config.TEST_START,
+    test_end: str = config.TEST_END,
+) -> pd.DataFrame:
+    """Run rolling_origin_backtest once with a conformalized quantile
+    predict_fn (make_conformalized_quantile_predict_fn), which fits both
+    quantile models together per block and corrects their raw predictions
+    with a held-out calibration slice of that block's own training data
+    (split-conformal / CQR — see that function's docstring for the
+    mechanism). Unlike run_quantile_backtests (independent, uncalibrated
+    per-quantile models, two separate backtest calls), this is a single
+    call: q10 and q90 are coupled by the calibration step and must come
+    from the same predict_fn invocation.
+
+    Returns y_true, y_naive, y_tso, plus one column per quantile named
+    q{int(q * 100)} (e.g. "q10", "q90"), calibrated to target
+    config.PREDICTION_INTERVAL_COVERAGE_TARGET rather than whatever the
+    raw model happens to produce.
+    """
+    return rolling_origin_backtest(
+        feature_matrix,
+        target_col,
+        predict_fn=make_conformalized_quantile_predict_fn(
+            quantiles=quantiles,
+            target_col=target_col,
+            params=params,
+            calibration_frac=calibration_frac,
+        ),
+        retrain_freq=retrain_freq,
+        test_start=test_start,
+        test_end=test_end,
+    )
 
 
 def run_quantile_backtests(
@@ -504,31 +693,36 @@ def diebold_mariano_test(errors_a: pd.Series, errors_b: pd.Series) -> dict:
 # CLI: run the real LightGBM backtest against the local processed dataset
 # ---------------------------------------------------------------------------
 
-# Candidate hyperparameter sets for `--sweep-quantile-params`, tried after
-# the real backtest showed the default quantile params (config.
-# LIGHTGBM_QUANTILE_PARAMS, same capacity as the point model: num_leaves=63,
-# n_estimators=500) under-covering badly (56% empirical vs. an 80% target).
-# Gradient-boosted quantile (pinball-loss) regression is prone to exactly
-# this: the tails of the loss get noisier gradients than the bulk, so a
-# high-capacity model fits the *training* quantiles well but generalizes
-# to a narrower-than-true spread on the test set — the fix is more
-# regularization, not more capacity, hence every candidate below is more
-# regularized than the current default, not less. "current_default" is
-# included as the baseline row so the comparison table shows the delta.
+# Candidate hyperparameter sets for `--sweep-quantile-params`. This grid
+# was already used once: a real backtest showed the *original* default
+# quantile params (num_leaves=63, n_estimators=500 -- the same capacity
+# as the point model) under-covering badly (56% empirical vs. an 80%
+# target). Gradient-boosted quantile (pinball-loss) regression is prone
+# to exactly this: the tails of the loss get noisier gradients than the
+# bulk, so a high-capacity model fits the *training* quantiles well but
+# generalizes to a narrower-than-true spread on the test set. The sweep's
+# results (regularization helped, but every candidate still fell well
+# short of 80% coverage) are what motivated the conformal calibration in
+# make_conformalized_quantile_predict_fn below; its best-pinball-loss
+# candidate ("regularized") is what config.LIGHTGBM_QUANTILE_PARAMS now
+# ships as the base model conformal calibration corrects. The original
+# (pre-regularization) default is kept here explicitly, rather than read
+# back from config, so this comparison stays meaningful even though
+# config's own default has since changed -- and so the same sweep can be
+# rerun later (a different test period, new features) without losing the
+# original baseline row.
+_ORIGINAL_UNREGULARIZED_QUANTILE_PARAMS = {
+    "objective": "quantile",
+    "n_estimators": 500,
+    "learning_rate": 0.05,
+    "num_leaves": 63,
+    "random_state": config.RANDOM_SEED,
+}
+
 QUANTILE_PARAM_SWEEP_GRID: dict[str, dict] = {
-    "current_default": dict(config.LIGHTGBM_QUANTILE_PARAMS),
-    "fewer_leaves": {**config.LIGHTGBM_QUANTILE_PARAMS, "num_leaves": 15},
-    "regularized": {
-        "objective": "quantile",
-        "n_estimators": 500,
-        "learning_rate": 0.05,
-        "num_leaves": 31,
-        "min_child_samples": 50,
-        "subsample": 0.8,
-        "subsample_freq": 1,
-        "colsample_bytree": 0.8,
-        "random_state": config.RANDOM_SEED,
-    },
+    "original_unregularized_default": _ORIGINAL_UNREGULARIZED_QUANTILE_PARAMS,
+    "fewer_leaves": {**_ORIGINAL_UNREGULARIZED_QUANTILE_PARAMS, "num_leaves": 15},
+    "regularized": dict(config.LIGHTGBM_QUANTILE_PARAMS),  # the shipped default, as of this sweep
     "heavy_regularization": {
         "objective": "quantile",
         "n_estimators": 800,
@@ -548,15 +742,20 @@ def run_full_backtest(
     test_start: str = config.TEST_START,
     test_end: str = config.TEST_END,
     skip_quantiles: bool = False,
+    calibrate_quantiles: bool = True,
 ) -> tuple[pd.DataFrame, pd.DataFrame, dict | None]:
     """Load the processed hourly dataset, build the feature matrix, check
     it for leakage, run the rolling-origin backtest with the LightGBM point
     model over [test_start, test_end], and (unless skip_quantiles) also run
-    it once per quantile in config.QUANTILE_LOW/HIGH, merging their columns
-    (q10, q90 by default) into the same forecast table. Computes point
-    metrics for all three point-forecast columns (seasonal-naive, TSO,
-    LightGBM) and, when the quantile columns are present, interval metrics
-    for them too.
+    the quantile backtest, merging its columns (q10, q90 by default) into
+    the same forecast table. By default (calibrate_quantiles=True) the
+    quantile backtest is the split-conformal-calibrated one
+    (run_conformal_quantile_backtest), since the raw/uncalibrated one badly
+    under-covers (see the module docstring); pass calibrate_quantiles=False
+    to get the uncalibrated run_quantile_backtests instead, e.g. to compare
+    the two. Computes point metrics for all three point-forecast columns
+    (seasonal-naive, TSO, LightGBM) and, when the quantile columns are
+    present, interval metrics for them too.
 
     Returns (forecast_table, metrics_table, interval_metrics) —
     interval_metrics is None when skip_quantiles is True. Does not write
@@ -587,14 +786,24 @@ def run_full_backtest(
 
     interval_metrics = None
     if not skip_quantiles:
-        logging.info(
-            "Running rolling-origin backtest with the LightGBM quantile "
-            "models (one retrain-per-block fit per quantile, so this "
-            "roughly doubles the runtime for the default 2 quantiles)..."
-        )
-        quantile_table = run_quantile_backtests(
-            matrix, config.LOAD_ACTUAL_COL, test_start=test_start, test_end=test_end
-        )
+        if calibrate_quantiles:
+            logging.info(
+                "Running the split-conformal-calibrated quantile backtest "
+                "(one retrain-per-block fit for both quantiles together, "
+                "plus the calibration step)..."
+            )
+            quantile_table = run_conformal_quantile_backtest(
+                matrix, config.LOAD_ACTUAL_COL, test_start=test_start, test_end=test_end
+            )
+        else:
+            logging.info(
+                "Running the uncalibrated quantile backtest (one "
+                "retrain-per-block fit per quantile, so this roughly "
+                "doubles the runtime for the default 2 quantiles)..."
+            )
+            quantile_table = run_quantile_backtests(
+                matrix, config.LOAD_ACTUAL_COL, test_start=test_start, test_end=test_end
+            )
         for col in quantile_table.columns:
             if col not in ("y_true", "y_naive", "y_tso"):
                 forecast_table[col] = quantile_table[col]
@@ -639,6 +848,13 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         "loss) — use this to pick a better-calibrated config. Does not "
         "write the forecast/metrics parquet files.",
     )
+    parser.add_argument(
+        "--no-conformal",
+        action="store_true",
+        help="Use the raw/uncalibrated quantile backtest instead of the "
+        "default split-conformal-calibrated one — mainly for comparing "
+        "the two, since the raw one is known to under-cover badly.",
+    )
     return parser
 
 
@@ -677,13 +893,17 @@ def main(argv: list[str] | None = None) -> None:
         return
 
     forecast_table, metrics_table, interval_metrics = run_full_backtest(
-        test_start=args.test_start, test_end=args.test_end, skip_quantiles=args.skip_quantiles
+        test_start=args.test_start,
+        test_end=args.test_end,
+        skip_quantiles=args.skip_quantiles,
+        calibrate_quantiles=not args.no_conformal,
     )
 
     pd.set_option("display.float_format", "{:.2f}".format)
     logging.info("\n%s", metrics_table)
     if interval_metrics is not None:
-        logging.info("\nInterval metrics (q10/q90):\n%s", interval_metrics)
+        calibration_note = "conformal-calibrated" if not args.no_conformal else "raw/uncalibrated"
+        logging.info("\nInterval metrics (q10/q90, %s):\n%s", calibration_note, interval_metrics)
 
     config.FORECAST_TABLE_PARQUET.parent.mkdir(parents=True, exist_ok=True)
     forecast_table.to_parquet(config.FORECAST_TABLE_PARQUET)

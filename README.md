@@ -139,10 +139,42 @@ deliberate exception: they use the *observed* value at the target hour as
 a stand-in for a day-ahead weather forecast OPSD doesn't provide (see
 Limitations below).
 
+Interval forecasts (q10/q90) come from two LightGBM quantile models
+(`config.LIGHTGBM_QUANTILE_PARAMS`), one per quantile, trained on the
+same origin-anchored features. A real backtest showed these raw quantile
+models badly under-covering their target interval (56% empirical coverage
+against an 80% target, plateauing around 69% even after a hyperparameter
+sweep) — a known failure mode of independently-trained pinball-loss
+models, not a bug in the harness. `forecast.py` corrects this with
+**split-conformal calibration** (CQR — Romano, Patterson & Candès, 2019,
+`make_conformalized_quantile_predict_fn`): each retrain block holds out a
+calibration slice of its own training data, measures how far off the raw
+q10/q90 predictions actually are on it (out-of-sample), and widens (or
+narrows) the interval by that measured amount so empirical coverage
+targets `config.PREDICTION_INTERVAL_COVERAGE_TARGET` rather than
+whatever the uncalibrated model happens to produce.
+
 ## Results
 
-_TBD — forecast metrics table, scenario comparison table, and key charts
-go here once the pipeline has been run._
+Real 2019 test-year backtest (`python -m energy_dispatch.forecast`), point
+metrics:
+
+| Model | MAE | RMSE | MAPE |
+|---|---|---|---|
+| Seasonal-naive | 1254.5 | 2000.2 | 4.40% |
+| TSO (ENTSO-E) | 272.7 | 371.4 | 0.95% |
+| LightGBM | 500.0 | 747.0 | 1.76% |
+
+The point model clears the naive baseline by a wide margin (60% lower
+MAE) but doesn't beat the professional TSO forecast — expected, not a
+bug: ENTSO-E's forecast has structural advantages this model doesn't
+(intraday updates, grid-operator-side data), and it isn't even helped by
+this project's weather-proxy assumption above, which should if anything
+flatter our model relative to a real forecast-error scenario.
+
+Interval metrics (q10/q90) and the dispatch-optimization scenario
+comparison are still _TBD_ — filled in once conformal calibration's
+real-data numbers and the optimization module are run.
 
 ## Assumptions and limitations
 
@@ -162,6 +194,7 @@ go here once the pipeline has been run._
 ## Stretch extensions
 
 See spec section 13 — forecasting solar/wind directly, unit commitment
-as a MILP, two-stage stochastic/robust optimization, conformal
-prediction, public Streamlit deployment, and generalizing to a second
-country.
+as a MILP, two-stage stochastic/robust optimization, public Streamlit
+deployment, and generalizing to a second country. (Conformal prediction
+was originally listed here too, but is now implemented — see
+"Forecasting design" above.)

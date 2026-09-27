@@ -174,11 +174,27 @@ LIGHTGBM_PARAMS = {
     "random_state": RANDOM_SEED,
 }
 
+# More regularized than LIGHTGBM_PARAMS on purpose: an uncalibrated
+# rolling-origin backtest on the real 2019 test year showed num_leaves=63
+# (i.e. matching the point model's capacity) badly overfitting the
+# training quantiles and under-covering on test (56% empirical vs. an 80%
+# target). A hyperparameter sweep (see forecast.QUANTILE_PARAM_SWEEP_GRID)
+# found this configuration had the best (lowest) pinball loss of the
+# candidates tried -- the proper scoring rule these models are actually
+# trained against -- even though none of the sweep's candidates closed
+# the full coverage gap by tuning alone. The remaining gap is corrected by
+# split-conformal calibration (see forecast.make_conformalized_quantile_
+# predict_fn), which is robust to the base model's own miscalibration, so
+# this config's job is to be a good base model, not to hit 80% by itself.
 LIGHTGBM_QUANTILE_PARAMS = {
     "objective": "quantile",
     "n_estimators": 500,
     "learning_rate": 0.05,
-    "num_leaves": 63,
+    "num_leaves": 31,
+    "min_child_samples": 50,
+    "subsample": 0.8,
+    "subsample_freq": 1,
+    "colsample_bytree": 0.8,
     "random_state": RANDOM_SEED,
 }
 
@@ -186,6 +202,15 @@ LIGHTGBM_QUANTILE_PARAMS = {
 # cadence during the test year, then forecast day by day until the next
 # retrain point.
 BACKTEST_RETRAIN_FREQ = "MS"  # month start
+
+# Split-conformal calibration (CQR): fraction of each retrain block's own
+# training data held out as a calibration slice (the most recent
+# origins, by forecast origin, not fit-df rows) used to measure how far
+# off the raw quantile predictions actually are out-of-sample, and
+# correct q10/q90 by that measured amount so empirical coverage targets
+# PREDICTION_INTERVAL_COVERAGE_TARGET rather than whatever the
+# uncalibrated model happens to produce.
+CONFORMAL_CALIBRATION_FRAC = 0.2
 
 
 # ---------------------------------------------------------------------------

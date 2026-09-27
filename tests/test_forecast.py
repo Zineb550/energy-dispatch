@@ -458,3 +458,149 @@ def test_sweep_quantile_params_returns_one_row_per_candidate(synthetic_df):
     assert "coverage" in result.columns
     assert "avg_interval_width" in result.columns
     assert (result["n"] > 0).all()
+
+
+# ---------------------------------------------------------------------------
+# rolling_origin_backtest — DataFrame-returning predict_fn
+# ---------------------------------------------------------------------------
+
+def test_rolling_origin_backtest_merges_dataframe_returning_predict_fn(synthetic_df):
+    matrix = features.build_feature_matrix(synthetic_df, target_col=config.LOAD_ACTUAL_COL)
+
+    def two_column_predict_fn(train_df, forecast_df):
+        return pd.DataFrame(
+            {"q10": 0.0, "q90": 1.0},
+            index=forecast_df.index,
+        )
+
+    result = forecast.rolling_origin_backtest(
+        matrix,
+        config.LOAD_ACTUAL_COL,
+        predict_fn=two_column_predict_fn,
+        retrain_freq="MS",
+        test_start="2018-01-01",
+        test_end="2018-01-31",
+    )
+
+    # The default output_col placeholder ("y_lgbm") must be dropped in
+    # favor of the DataFrame's own columns, not left behind as a stray
+    # all-NA column.
+    assert "y_lgbm" not in result.columns
+    assert set(result.columns) == {"y_true", "y_naive", "y_tso", "q10", "q90"}
+    assert (result["q10"] == 0.0).all()
+    assert (result["q90"] == 1.0).all()
+
+
+# ---------------------------------------------------------------------------
+# make_conformalized_quantile_predict_fn / run_conformal_quantile_backtest
+# ---------------------------------------------------------------------------
+
+def test_conformalized_predict_fn_returns_dataframe_with_expected_columns(synthetic_df):
+    matrix = features.build_feature_matrix(synthetic_df, target_col=config.LOAD_ACTUAL_COL)
+    split_at = matrix.index[len(matrix) // 2]
+    train_df = matrix[matrix.index < split_at]
+    forecast_df = matrix[
+        (matrix.index >= split_at) & (matrix.index < split_at + pd.Timedelta(hours=24))
+    ]
+
+    fast_params = {"objective": "quantile", "n_estimators": 20, "random_state": 42}
+    predict_fn = forecast.make_conformalized_quantile_predict_fn(params=fast_params)
+    result = predict_fn(train_df, forecast_df)
+
+    assert isinstance(result, pd.DataFrame)
+    assert set(result.columns) == {"q10", "q90"}
+    assert list(result.index) == list(forecast_df.index)
+    assert (result["q90"] >= result["q10"]).all()  # the correction must not cross the bounds
+
+
+def test_conformal_quantile_correction_hand_computed():
+    scores = np.array([1.0, 2.0, 3.0, 4.0, 5.0])
+    # n=5, target=0.8: level = min(1, ceil(6*0.8)/5) = min(1, ceil(4.8)/5)
+    # = min(1, 5/5) = 1.0 -> the quantile at level 1.0 is the max, 5.0.
+    q_hat = forecast._conformal_quantile_correction(scores, target_coverage=0.8)
+    assert np.isclose(q_hat, 5.0)
+
+
+def test_conformal_quantile_correction_can_be_negative():
+    # If the raw interval already over-covers on the calibration slice
+    # (every score strongly negative -- the true value sat well inside
+    # the raw [q_low, q_high] every time), the correction narrows the
+    # interval rather than widening it. Split-conformal calibration
+    # targets the correct coverage either way; it is not a one-directional
+    # "always make it wider" heuristic, which is what this guards against
+    # regressing to.
+    scores = np.array([-5.0, -4.0, -3.0, -2.0, -1.0])
+    q_hat = forecast._conformal_quantile_correction(scores, target_coverage=0.5)
+    assert q_hat < 0
+
+
+def test_conformalized_predict_fn_requires_at_least_two_distinct_origins():
+    idx = pd.date_range("2019-06-05 00:00", periods=5, freq="h", tz="Europe/Madrid").tz_convert(
+        "UTC"
+    )
+    tiny_train = pd.DataFrame(
+        {
+            config.LOAD_ACTUAL_COL: [1.0, 2.0, 3.0, 4.0, 5.0],
+            "origin_utc": pd.Timestamp("2019-06-04 10:00", tz="Europe/Madrid").tz_convert("UTC"),
+            config.WEATHER_TEMPERATURE_COL: 20.0,
+        },
+        index=idx,
+    )
+    predict_fn = forecast.make_conformalized_quantile_predict_fn()
+    with pytest.raises(ValueError, match="not enough distinct forecast origins"):
+        predict_fn(tiny_train, tiny_train)
+
+
+def test_run_conformal_quantile_backtest_returns_expected_columns(synthetic_df):
+    matrix = features.build_feature_matrix(synthetic_df, target_col=config.LOAD_ACTUAL_COL)
+    fast_params = {"objective": "quantile", "n_estimators": 20, "random_state": 42}
+
+    result = forecast.run_conformal_quantile_backtest(
+        matrix,
+        config.LOAD_ACTUAL_COL,
+        params=fast_params,
+        retrain_freq="MS",
+        test_start="2018-03-01",
+        test_end="2018-03-31",
+    )
+
+    assert set(result.columns) == {"y_true", "y_naive", "y_tso", "q10", "q90"}
+    assert result["q10"].notna().all()
+    assert result["q90"].notna().all()
+    assert (result["q90"] >= result["q10"]).all()
+
+
+def test_run_full_backtest_calibrate_quantiles_flag_selects_the_backtest(
+    synthetic_df, monkeypatch
+):
+    matrix = features.build_feature_matrix(synthetic_df, target_col=config.LOAD_ACTUAL_COL)
+    calls = {"conformal": 0, "raw": 0}
+    original_run_quantile_backtests = forecast.run_quantile_backtests
+
+    def fake_conformal(*args, **kwargs):
+        calls["conformal"] += 1
+        return original_run_quantile_backtests(*args, **kwargs)
+
+    def fake_raw(*args, **kwargs):
+        calls["raw"] += 1
+        return original_run_quantile_backtests(*args, **kwargs)
+
+    monkeypatch.setattr(forecast, "run_conformal_quantile_backtest", fake_conformal)
+    monkeypatch.setattr(forecast, "run_quantile_backtests", fake_raw)
+    monkeypatch.setattr(pd, "read_parquet", lambda *_args, **_kwargs: synthetic_df)
+    monkeypatch.setattr(features, "assert_no_leakage", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        features,
+        "build_feature_matrix",
+        lambda *_args, **_kwargs: matrix,
+    )
+
+    forecast.run_full_backtest(
+        test_start="2018-03-01", test_end="2018-03-31", calibrate_quantiles=True
+    )
+    assert calls == {"conformal": 1, "raw": 0}
+
+    forecast.run_full_backtest(
+        test_start="2018-03-01", test_end="2018-03-31", calibrate_quantiles=False
+    )
+    assert calls == {"conformal": 1, "raw": 1}
