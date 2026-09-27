@@ -334,6 +334,38 @@ def run_quantile_backtests(
     return combined
 
 
+def sweep_quantile_params(
+    feature_matrix: pd.DataFrame,
+    param_grid: dict[str, dict],
+    target_col: str = config.LOAD_ACTUAL_COL,
+    quantiles: tuple[float, ...] = (config.QUANTILE_LOW, config.QUANTILE_HIGH),
+    retrain_freq: str = config.BACKTEST_RETRAIN_FREQ,
+    test_start: str = config.TEST_START,
+    test_end: str = config.TEST_END,
+) -> pd.DataFrame:
+    """Run run_quantile_backtests once per named hyperparameter set in
+    param_grid ({"label": {...LightGBM params...}, ...}) and return one row
+    of compute_interval_metrics per label, so several candidate
+    hyperparameter sets can be compared for calibration (coverage vs.
+    config.PREDICTION_INTERVAL_COVERAGE_TARGET) in a single local run
+    instead of one diff/apply/run round-trip per candidate.
+    """
+    rows = []
+    for label, params in param_grid.items():
+        table = run_quantile_backtests(
+            feature_matrix,
+            target_col,
+            quantiles=quantiles,
+            params=params,
+            retrain_freq=retrain_freq,
+            test_start=test_start,
+            test_end=test_end,
+        )
+        metrics = compute_interval_metrics(table)
+        rows.append({"params": label, **metrics})
+    return pd.DataFrame(rows).set_index("params")
+
+
 # ---------------------------------------------------------------------------
 # Point metrics
 # ---------------------------------------------------------------------------
@@ -472,6 +504,45 @@ def diebold_mariano_test(errors_a: pd.Series, errors_b: pd.Series) -> dict:
 # CLI: run the real LightGBM backtest against the local processed dataset
 # ---------------------------------------------------------------------------
 
+# Candidate hyperparameter sets for `--sweep-quantile-params`, tried after
+# the real backtest showed the default quantile params (config.
+# LIGHTGBM_QUANTILE_PARAMS, same capacity as the point model: num_leaves=63,
+# n_estimators=500) under-covering badly (56% empirical vs. an 80% target).
+# Gradient-boosted quantile (pinball-loss) regression is prone to exactly
+# this: the tails of the loss get noisier gradients than the bulk, so a
+# high-capacity model fits the *training* quantiles well but generalizes
+# to a narrower-than-true spread on the test set — the fix is more
+# regularization, not more capacity, hence every candidate below is more
+# regularized than the current default, not less. "current_default" is
+# included as the baseline row so the comparison table shows the delta.
+QUANTILE_PARAM_SWEEP_GRID: dict[str, dict] = {
+    "current_default": dict(config.LIGHTGBM_QUANTILE_PARAMS),
+    "fewer_leaves": {**config.LIGHTGBM_QUANTILE_PARAMS, "num_leaves": 15},
+    "regularized": {
+        "objective": "quantile",
+        "n_estimators": 500,
+        "learning_rate": 0.05,
+        "num_leaves": 31,
+        "min_child_samples": 50,
+        "subsample": 0.8,
+        "subsample_freq": 1,
+        "colsample_bytree": 0.8,
+        "random_state": config.RANDOM_SEED,
+    },
+    "heavy_regularization": {
+        "objective": "quantile",
+        "n_estimators": 800,
+        "learning_rate": 0.03,
+        "num_leaves": 15,
+        "min_child_samples": 100,
+        "subsample": 0.7,
+        "subsample_freq": 1,
+        "colsample_bytree": 0.7,
+        "random_state": config.RANDOM_SEED,
+    },
+}
+
+
 def run_full_backtest(
     processed_path=config.PROCESSED_HOURLY_PARQUET,
     test_start: str = config.TEST_START,
@@ -559,12 +630,51 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="Only run the LightGBM point model (skip the q10/q90 quantile "
         "backtests, roughly halving the runtime).",
     )
+    parser.add_argument(
+        "--sweep-quantile-params",
+        action="store_true",
+        help="Instead of the normal run, try several LightGBM quantile "
+        "hyperparameter sets (QUANTILE_PARAM_SWEEP_GRID) and print a "
+        "comparison of their interval metrics (coverage, width, pinball "
+        "loss) — use this to pick a better-calibrated config. Does not "
+        "write the forecast/metrics parquet files.",
+    )
     return parser
 
 
 def main(argv: list[str] | None = None) -> None:
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     args = _build_arg_parser().parse_args(argv)
+
+    if args.sweep_quantile_params:
+        logging.info("Loading processed dataset from %s", config.PROCESSED_HOURLY_PARQUET)
+        df = pd.read_parquet(config.PROCESSED_HOURLY_PARQUET)
+        logging.info("Building feature matrix...")
+        matrix = features.build_feature_matrix(df, target_col=config.LOAD_ACTUAL_COL)
+        features.assert_no_leakage(matrix)
+
+        logging.info(
+            "Sweeping %d quantile hyperparameter sets over %s to %s "
+            "(this fits 2 quantile models x every retrain block, per set, "
+            "so it takes roughly len(QUANTILE_PARAM_SWEEP_GRID)x as long as "
+            "a single quantile backtest)...",
+            len(QUANTILE_PARAM_SWEEP_GRID),
+            args.test_start,
+            args.test_end,
+        )
+        sweep_table = sweep_quantile_params(
+            matrix,
+            QUANTILE_PARAM_SWEEP_GRID,
+            test_start=args.test_start,
+            test_end=args.test_end,
+        )
+        pd.set_option("display.float_format", "{:.4f}".format)
+        logging.info(
+            "\nInterval metrics by hyperparameter set (target_coverage=%.2f):\n%s",
+            config.PREDICTION_INTERVAL_COVERAGE_TARGET,
+            sweep_table,
+        )
+        return
 
     forecast_table, metrics_table, interval_metrics = run_full_backtest(
         test_start=args.test_start, test_end=args.test_end, skip_quantiles=args.skip_quantiles

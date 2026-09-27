@@ -427,3 +427,34 @@ def test_compute_interval_metrics_drops_rows_with_missing_values():
     )
     metrics = forecast.compute_interval_metrics(table)
     assert metrics["n"] == 2
+
+
+# ---------------------------------------------------------------------------
+# sweep_quantile_params
+# ---------------------------------------------------------------------------
+
+def test_sweep_quantile_params_returns_one_row_per_candidate(synthetic_df):
+    matrix = features.build_feature_matrix(synthetic_df, target_col=config.LOAD_ACTUAL_COL)
+    grid = {
+        "few_leaves": {
+            "objective": "quantile",
+            "n_estimators": 15,
+            "num_leaves": 7,
+            "random_state": 42,
+        },
+        "more_leaves": {
+            "objective": "quantile",
+            "n_estimators": 15,
+            "num_leaves": 31,
+            "random_state": 42,
+        },
+    }
+
+    result = forecast.sweep_quantile_params(
+        matrix, grid, retrain_freq="MS", test_start="2018-03-01", test_end="2018-03-31"
+    )
+
+    assert list(result.index) == ["few_leaves", "more_leaves"]
+    assert "coverage" in result.columns
+    assert "avg_interval_width" in result.columns
+    assert (result["n"] > 0).all()
