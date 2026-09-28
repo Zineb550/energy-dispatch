@@ -101,6 +101,11 @@ pip install -e ".[dev]"
 # 1. Fetch + clean data (downloads into data/raw/, writes data/processed/spain_hourly.parquet)
 python -m energy_dispatch.data
 
+# Run the stages individually (until pipeline.py is wired up):
+python -m energy_dispatch.forecast   # writes data/processed/forecast_test_period.parquet
+python -m energy_dispatch.evaluate   # dispatch + realized cost -> scenario_results.parquet
+                                     # (add --max-days 7 for a quick smoke run)
+
 # 2. Run the full pipeline (forecast backtest -> dispatch -> evaluation)
 python -m energy_dispatch.pipeline
 
@@ -154,6 +159,51 @@ narrows) the interval by that measured amount so empirical coverage
 targets `config.PREDICTION_INTERVAL_COVERAGE_TARGET` rather than
 whatever the uncalibrated model happens to produce.
 
+## Evaluation design
+
+`evaluate.py` measures what forecast quality is worth *after* a decision
+has been made on it. For each local (Europe/Madrid) day of the 2019 test
+year:
+
+1. **Plan (10:00 on day D).** `optimize.plan_day_ahead_dispatch` builds
+   the day-ahead dispatch for D+1 from one forecast plus the renewable
+   availability (solar + wind), and nothing else.
+2. **Reveal.** D+1 happens and actual demand becomes known. The plan is
+   not revised: there is no real-time re-dispatch.
+3. **Settle.** The difference between actual demand and the plan is
+   bought or sold on the balancing market.
+
+Definitions, per hour (MW over one hour = MWh):
+
+| Quantity | Definition |
+|---|---|
+| Planned supply | Σ generation + renewable used + battery discharge − battery charge (the LP's demand-balance row, so it equals the forecast) |
+| Imbalance | actual demand − planned supply; **positive** = under-supplied (upward energy bought), **negative** = surplus |
+| Imbalance cost | €200/MWh × upward imbalance − €20/MWh × surplus (surplus is *sold*, a credit, since its generation cost is already in the planned cost) |
+| Planned cost | the LP objective: Σ marginal cost × generation, on the forecast profile |
+| Realized cost | planned cost + imbalance cost |
+
+Eight scenarios are evaluated: {perfect foresight, seasonal naive, TSO,
+LightGBM} × {battery off, battery on}. Battery-off is the same LP with a
+zero-capacity battery. **Perfect foresight** plans on actual demand and is
+an idealized reference (lower bound), not an achievable forecasting
+system. Every scenario covers exactly the same set of days: a day is
+evaluated only if it has all of its local hours (23/24/25 on DST days) and
+no missing values in any forecast, the actual load, or renewables. Skipped
+days are reported with a reason.
+
+Two properties of this setup matter when reading the results:
+
+- Because the plan is fixed, planned supply equals the forecast, so
+  **imbalance equals the forecast error, with or without the battery**.
+  The battery lowers planned cost by shifting energy toward cheaper hours
+  of the *forecast* profile. It does not absorb forecast errors, since it
+  never reacts to actual demand. Any difference in battery value between
+  forecasts comes from the forecast's shape.
+- Renewable availability uses observed output (perfect renewable
+  foresight), so the evaluation isolates **demand** forecast error, not
+  total renewable uncertainty.
+
 ## Results
 
 Real 2019 test-year backtest (`python -m energy_dispatch.forecast`), point
@@ -187,8 +237,9 @@ uncalibrated candidate tried in the hyperparameter sweep (previously as
 low as 155.3/121.7), so this isn't a coverage-vs-accuracy trade-off, it's
 a straightforward improvement on both axes.
 
-The dispatch-optimization scenario comparison is still _TBD_ — filled in
-once `optimize.py` is implemented.
+The realized-cost scenario comparison (see "Evaluation design" above) is
+still _TBD_. It will be filled in once `python -m energy_dispatch.evaluate`
+has been run on the real 2019 test year.
 
 ## Assumptions and limitations
 
@@ -198,6 +249,11 @@ once `optimize.py` is implemented.
 - Day-ahead weather **forecasts** are not available in the OPSD dataset;
   observed weather is used as a proxy feature, which overstates the
   accuracy achievable with a real weather forecast.
+- Renewable availability in the dispatch LP is the *observed* solar + wind
+  output (perfect renewable foresight); only demand is forecast.
+- No real-time re-dispatch: the day-ahead plan is fixed, and every MWh
+  of forecast error is settled on the balancing market, even when
+  curtailed renewables or the battery could have covered it.
 - Single-node grid: no transmission constraints or nodal pricing.
 - No unit commitment — generation units have no on/off decision, start-up
   cost, or minimum up-time; this is a pure economic-dispatch LP, not a

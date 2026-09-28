@@ -26,6 +26,7 @@ PROCESSED_HOURLY_PARQUET = PROCESSED_DATA_DIR / "spain_hourly.parquet"
 FORECAST_TABLE_PARQUET = PROCESSED_DATA_DIR / "forecast_test_period.parquet"
 METRICS_TABLE_PARQUET = PROCESSED_DATA_DIR / "forecast_metrics.parquet"
 SCENARIO_RESULTS_PARQUET = PROCESSED_DATA_DIR / "scenario_results.parquet"
+EVALUATION_HOURLY_PARQUET = PROCESSED_DATA_DIR / "evaluation_hourly.parquet"
 
 # ---------------------------------------------------------------------------
 # Data source
