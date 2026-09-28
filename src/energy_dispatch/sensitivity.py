@@ -384,14 +384,8 @@ def sweep_renewable_share(
     raise NotImplementedError
 
 
-def uncertainty_aware_plan(forecast_table: pd.DataFrame) -> pd.DataFrame:
-    """Plan dispatch against the q90 forecast (or point forecast + a
-    reserve sized from the [q10, q90] interval width) instead of the
-    point forecast, and compare realized cost against the point-forecast
-    plan. Demonstrates the practical value of the prediction intervals
-    from forecast.py's quantile models.
-    """
-    raise NotImplementedError
+# Planning on the forecast intervals (the former uncertainty_aware_plan stub)
+# lives in planning.py.
 
 
 # ---------------------------------------------------------------------------

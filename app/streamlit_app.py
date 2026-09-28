@@ -494,6 +494,68 @@ def page_cost() -> None:
         "imbalance cost: with a fixed day-ahead plan, imbalance equals the forecast error "
         "whether or not the battery exists."
     )
+    section_planning()
+
+
+def section_planning() -> None:
+    """Planning on a quantile of the calibrated LightGBM forecast (planning.py)."""
+    results = load("planning")
+    if results is None:
+        return  # optional extension: hidden until `python -m energy_dispatch.planning` has run
+    plans, references = dashboard.planning_view(results)
+    tau_star = results.attrs.get("theoretical_quantile") or float(
+        plans.loc[plans["is_theoretical_optimum"], "target_quantile"].iloc[0]
+    )
+
+    st.subheader("Planning on the forecast interval")
+    st.markdown(
+        "A shortfall is bought at €200/MWh while a surplus is sold at €20/MWh, so under-"
+        "planning costs more than over-planning. When CCGT is the marginal unit, the "
+        f"cost-minimizing plan is the **{tau_star:.0%} quantile** of the demand forecast "
+        "(newsvendor rule: (200 − 60) / ((200 − 60) + (60 − 20))), not the point forecast. "
+        "Each bar plans on a quantile of the LightGBM forecast, interpolated from its "
+        "conformal-calibrated q10–q90 interval, and shows the realized-cost saving "
+        "against planning on the point forecast (battery off)."
+    )
+    labels = [
+        f"τ* = {t:.3f}" if star else f"τ = {t:.2f}"
+        for t, star in zip(plans["target_quantile"], plans["is_theoretical_optimum"], strict=True)
+    ]
+    colors = ["#2a78d6" if star else "#9bc0ea" for star in plans["is_theoretical_optimum"]]
+    fig = go.Figure(
+        go.Bar(x=labels, y=plans["saving_vs_point_plan_eur"] / 1e6, marker_color=colors,
+               text=[f"{v / 1e6:,.1f}" for v in plans["saving_vs_point_plan_eur"]],
+               textposition="outside", name="Saving vs point-forecast plan")
+    )  # fmt: skip
+    tso = references[references["forecast_method"] == "tso"]
+    if not tso.empty:
+        fig.add_hline(
+            y=tso["saving_vs_point_plan_eur"].iloc[0] / 1e6, line_dash="dash",
+            line_color=METHOD_COLORS["tso"],
+            annotation_text="TSO point forecast", annotation_position="top left",
+        )  # fmt: skip
+    fig.update_layout(
+        yaxis_title="€ million / year", xaxis_title="Planning quantile",
+        xaxis_type="category", showlegend=False,
+    )  # fmt: skip
+    show(fig, "Realized-cost saving by planning quantile", hovermode="closest")
+
+    star = plans[plans["is_theoretical_optimum"]]
+    if not star.empty:
+        row = star.iloc[0]
+        st.markdown(
+            f"Planning on τ* raises the plan by {row['mean_uplift_mw']:,.0f} MW on average and "
+            f"changes realized cost by **{eur(row['saving_vs_point_plan_eur'])}/yr "
+            f"({row['saving_vs_point_plan_pct']:.2f}%)** against the point-forecast plan, "
+            "with the same forecast model: only the decision rule changes."
+        )
+    st.caption(
+        "τ* is fixed from the prices before looking at any result, so its bar is an honest "
+        "out-of-sample test. The other bars are evaluated on the same 2019 test year; picking "
+        "the best of them afterwards would be selecting on the test set."
+    )
+    with st.expander("Table view"):
+        st.dataframe(results, **TABLE_WIDTH, hide_index=True)
 
 
 def page_sensitivity() -> None:

@@ -28,6 +28,7 @@ METRICS_TABLE_PARQUET = PROCESSED_DATA_DIR / "forecast_metrics.parquet"
 SCENARIO_RESULTS_PARQUET = PROCESSED_DATA_DIR / "scenario_results.parquet"
 EVALUATION_HOURLY_PARQUET = PROCESSED_DATA_DIR / "evaluation_hourly.parquet"
 SENSITIVITY_RESULTS_PARQUET = PROCESSED_DATA_DIR / "sensitivity_results.parquet"
+PLANNING_RESULTS_PARQUET = PROCESSED_DATA_DIR / "planning_results.parquet"
 
 # ---------------------------------------------------------------------------
 # Data source

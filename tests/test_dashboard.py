@@ -12,7 +12,7 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
-from energy_dispatch import config, dashboard, evaluate, forecast, sensitivity
+from energy_dispatch import config, dashboard, evaluate, forecast, planning, sensitivity
 
 APP = Path(__file__).resolve().parents[1] / "app" / "streamlit_app.py"
 DAYS = ["2019-01-22", "2019-06-12"]
@@ -65,6 +65,7 @@ def results(tmp_path_factory):
         "evaluation_hourly": hourly,
         "scenario_summary": summary,
         "sensitivity": sens,
+        "planning": planning.uncertainty_aware_plan(table, renewable, quantiles=(0.5, 0.8))[0],
     }
     folder = tmp_path_factory.mktemp("processed")
     paths = {}
@@ -114,6 +115,22 @@ def test_bundled_results_are_used_when_data_processed_is_empty(tmp_path, results
     pd.testing.assert_frame_equal(
         dashboard.load_result("scenario_summary"), results[0]["scenario_summary"]
     )
+
+
+def test_export_skips_optional_results_that_were_not_generated(tmp_path, results, point_app_at):
+    _, paths = results
+    without_planning = dict(paths, planning=tmp_path / "missing" / "planning_results.parquet")
+    point_app_at(without_planning)
+    written = dashboard.export_demo_results(tmp_path / "demo")
+    assert len(written) == len(dashboard.RESULT_FILES) - 1
+
+
+def test_planning_view_separates_plans_and_references(results):
+    frames, _ = results
+    plans, references = dashboard.planning_view(frames["planning"])
+    assert list(plans["target_quantile"]) == [0.5, 0.8]
+    assert set(references["forecast_method"]) == {"perfect_foresight", "tso"}
+    assert references["label"].notna().all()
 
 
 def test_headline_metrics_match_compare_scenarios(results):
@@ -225,6 +242,10 @@ def test_every_page_renders_with_results(results, point_app_at):
         assert not app.exception, (page, app.exception)
         assert not app.warning or page == "Storage sensitivity", (page, app.warning)
 
+    app.sidebar.radio[0].set_value("Cost & forecast value").run()
+    assert any("forecast interval" in h.value for h in app.subheader)
+
+    app.sidebar.radio[0].set_value("What-if").run()
     # What-if: submitting the form solves the LP and shows the comparison
     app.button[0].click().run()
     assert not app.exception

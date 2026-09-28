@@ -50,7 +50,10 @@ RESULT_FILES: dict[str, tuple[Path, str]] = {
     "evaluation_hourly": (config.EVALUATION_HOURLY_PARQUET, "python -m energy_dispatch.evaluate"),
     "scenario_summary": (config.SCENARIO_RESULTS_PARQUET, "python -m energy_dispatch.evaluate"),
     "sensitivity": (config.SENSITIVITY_RESULTS_PARQUET, "python -m energy_dispatch.sensitivity"),
+    "planning": (config.PLANNING_RESULTS_PARQUET, "python -m energy_dispatch.planning"),
 }
+# Extensions whose page section is simply hidden when the file is absent.
+OPTIONAL_RESULTS: frozenset[str] = frozenset({"planning"})
 
 
 # Copies of the result files committed with the app, so a hosted deployment
@@ -88,13 +91,16 @@ def missing_file_message(name: str) -> str:
 def export_demo_results(dest: Path | None = None) -> list[Path]:
     """Copy the result files from data/processed/ into DEMO_RESULTS_DIR (or
     dest) so they can be committed with the app for a hosted deployment.
-    Only the five dashboard result files are copied — never raw data."""
+    Only the dashboard result files are copied — never raw data. Optional
+    extension results are skipped if they have not been generated."""
     dest = Path(dest or DEMO_RESULTS_DIR)
     dest.mkdir(parents=True, exist_ok=True)
     written = []
-    for path, command in RESULT_FILES.values():
+    for name, (path, command) in RESULT_FILES.items():
         path = Path(path)
         if not path.exists():
+            if name in OPTIONAL_RESULTS:
+                continue
             raise FileNotFoundError(f"{path} is missing; run `{command}` first")
         target = dest / path.name
         shutil.copy2(path, target)
@@ -275,6 +281,15 @@ def cost_above_reference(summary: pd.DataFrame, battery: str = "off") -> pd.Data
     out = out.drop(index="perfect_foresight", errors="ignore")
     out.index = out.index.map(FORECAST_LABELS)
     return out
+
+
+def planning_view(planning: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Split planning.py's summary into the quantile-plan rows (sorted by
+    target quantile) and the reference rows (perfect foresight, TSO)."""
+    plans = planning[planning["target_quantile"].notna()].sort_values("target_quantile")
+    references = planning[planning["target_quantile"].isna()].copy()
+    references["label"] = references["forecast_method"].map(FORECAST_LABELS)
+    return plans.reset_index(drop=True), references.reset_index(drop=True)
 
 
 def battery_value_by_forecast(summary: pd.DataFrame) -> pd.DataFrame:
