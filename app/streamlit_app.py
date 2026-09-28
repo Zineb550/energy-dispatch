@@ -13,12 +13,20 @@ sensitivity logic lives in this file.
 from __future__ import annotations
 
 import datetime as dt
+import inspect
+import sys
+from pathlib import Path
 
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
-from energy_dispatch import config, dashboard, sensitivity
+try:
+    import energy_dispatch  # noqa: F401  (installed with `pip install -e .`)
+except ModuleNotFoundError:  # e.g. a hosted deployment that only installs requirements.txt
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+
+from energy_dispatch import config, dashboard, sensitivity  # noqa: E402
 
 st.set_page_config(page_title="Energy dispatch: forecast value & storage", layout="wide")
 
@@ -57,6 +65,20 @@ SUPPLY_LABELS = {
 }
 BATTERY_COLORS = {"off": NEUTRAL, "on": "#eda100"}
 
+
+def _full_width(element) -> dict:
+    """Full-width keyword for a chart/table call: `width="stretch"` on recent
+    Streamlit (where use_container_width is deprecated), the older
+    `use_container_width=True` otherwise."""
+    param = inspect.signature(element).parameters.get("width")
+    if param is not None and isinstance(param.default, str):
+        return {"width": "stretch"}
+    return {"use_container_width": True}
+
+
+CHART_WIDTH = _full_width(st.plotly_chart)
+TABLE_WIDTH = _full_width(st.dataframe)
+
 ILLUSTRATIVE_NOTE = (
     "Simulated 2019 system. Capacities, marginal costs, ramp limits, battery "
     "parameters and balancing prices are illustrative assumptions, not a "
@@ -94,8 +116,8 @@ def mwh(value: float) -> str:
 
 
 def _mtime(name: str) -> float | None:
-    path = dashboard.RESULT_FILES[name][0]
-    return path.stat().st_mtime if path.exists() else None
+    path = dashboard.resolve_result_path(name)
+    return path.stat().st_mtime if path is not None else None
 
 
 @st.cache_data(show_spinner=False)
@@ -127,7 +149,7 @@ def show(fig: go.Figure, title: str | None = None, hovermode: str = "x unified")
         legend={"orientation": "h", "yanchor": "bottom", "y": 1.02, "x": 0, "traceorder": "normal"},
         hovermode=hovermode,
     )
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, **CHART_WIDTH)
 
 
 def delta_text(difference: float) -> str | None:
@@ -258,7 +280,7 @@ def page_forecast() -> None:
     c1, c2 = st.columns(2)
     with c1:
         st.markdown(f"**Point-forecast error on {day}**")
-        st.dataframe(dashboard.forecast_metrics_for(rows).round(2), use_container_width=True)
+        st.dataframe(dashboard.forecast_metrics_for(rows).round(2), **TABLE_WIDTH)
     with c2:
         st.markdown("**Full test period (2019)**")
         metrics = load("forecast_metrics")
@@ -266,7 +288,7 @@ def page_forecast() -> None:
             metrics = metrics.rename(index=dashboard.FORECAST_COLUMN_LABELS)
         else:
             metrics = dashboard.forecast_metrics_for(table)
-        st.dataframe(metrics.round(2), use_container_width=True)
+        st.dataframe(metrics.round(2), **TABLE_WIDTH)
 
     interval = dashboard.interval_metrics_for(table)
     if interval is not None:
@@ -401,7 +423,7 @@ def page_cost() -> None:
                 "Forecast MAE (MW)": "{:,.1f}",
             }  # fmt: skip
         ),
-        use_container_width=True,
+        **TABLE_WIDTH,
         hide_index=True,
     )
 
@@ -465,7 +487,7 @@ def page_cost() -> None:
                 "battery_savings_pct": "Savings (% of cost without battery)",
             }
         ).style.format("{:,.2f}"),
-        use_container_width=True,
+        **TABLE_WIDTH,
     )
     st.caption(
         "The battery saves about the same with every forecast, and none of it comes from "
@@ -511,7 +533,7 @@ def page_sensitivity() -> None:
             xaxis_type="category", showlegend=False, hovermode="closest",
         )  # fmt: skip
         with container:
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, **CHART_WIDTH)
     st.caption("Darker bar = baseline value. Hatched bar = evaluated on fewer days (see below).")
 
     fig = go.Figure()
@@ -551,7 +573,7 @@ def page_sensitivity() -> None:
             "change what imbalance costs, but imbalance does not depend on the battery."
         )
     with st.expander("Table view"):
-        st.dataframe(view, use_container_width=True, hide_index=True)
+        st.dataframe(view, **TABLE_WIDTH, hide_index=True)
 
 
 @st.cache_data(show_spinner=False)
@@ -649,7 +671,7 @@ def page_what_if() -> None:
     )  # fmt: skip
     st.dataframe(
         table.style.format({c: "{:,.0f}" for c in table.columns if c != "System"}),
-        use_container_width=True,
+        **TABLE_WIDTH,
         hide_index=True,
     )
     st.caption(
@@ -669,4 +691,6 @@ PAGES = {
 
 choice = st.sidebar.radio("Section", list(PAGES))
 st.sidebar.caption(ILLUSTRATIVE_NOTE)
+if any(dashboard.is_bundled(name) for name in dashboard.RESULT_FILES):
+    st.sidebar.caption("Showing the bundled results of the real 2019 run (app/demo_results/).")
 PAGES[choice]()

@@ -78,9 +78,11 @@ def results(tmp_path_factory):
 def point_app_at(monkeypatch):
     """Point dashboard.RESULT_FILES at a folder of result files."""
 
-    def _point(paths: dict[str, Path]):
+    def _point(paths: dict[str, Path], demo_dir: Path | None = None):
         for name, (_, command) in list(dashboard.RESULT_FILES.items()):
             monkeypatch.setitem(dashboard.RESULT_FILES, name, (paths[name], command))
+        # never pick up a real bundled copy (app/demo_results/) during tests
+        monkeypatch.setattr(dashboard, "DEMO_RESULTS_DIR", demo_dir or Path("/nonexistent"))
 
     return _point
 
@@ -95,6 +97,22 @@ def test_missing_result_file_returns_none_with_a_how_to_message(tmp_path, point_
     assert dashboard.load_result("scenario_summary") is None
     assert "python -m energy_dispatch.evaluate" in dashboard.missing_file_message(
         "scenario_summary"
+    )
+
+
+def test_bundled_results_are_used_when_data_processed_is_empty(tmp_path, results, point_app_at):
+    _, paths = results
+    demo = tmp_path / "demo_results"
+    # export from the "processed" folder, then point the app at an empty one
+    point_app_at(paths)
+    written = dashboard.export_demo_results(demo)
+    assert sorted(p.name for p in written) == sorted(p.name for p in paths.values())
+
+    empty = {name: tmp_path / "processed" / path.name for name, path in paths.items()}
+    point_app_at(empty, demo_dir=demo)
+    assert dashboard.is_bundled("scenario_summary")
+    pd.testing.assert_frame_equal(
+        dashboard.load_result("scenario_summary"), results[0]["scenario_summary"]
     )
 
 

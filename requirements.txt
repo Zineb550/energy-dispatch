@@ -1,0 +1,11 @@
+# Runtime dependencies of the Streamlit dashboard (app/streamlit_app.py), used
+# by Streamlit Community Cloud. The app adds src/ to the import path itself, so
+# the package does not need installing. For the full pipeline (LightGBM, SHAP,
+# ...), use `pip install -e ".[dev]"` with pyproject.toml instead.
+pandas>=2.1
+numpy>=1.26
+pyarrow>=14.0
+holidays>=0.45
+pulp>=2.8,<4
+plotly>=5.18
+streamlit>=1.32

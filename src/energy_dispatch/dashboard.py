@@ -14,7 +14,9 @@ This module has no Streamlit import, so it can be tested directly.
 
 from __future__ import annotations
 
+import argparse
 import datetime as dt
+import shutil
 from pathlib import Path
 
 import pandas as pd
@@ -51,16 +53,69 @@ RESULT_FILES: dict[str, tuple[Path, str]] = {
 }
 
 
-def load_result(name: str, paths: dict[str, Path] | None = None) -> pd.DataFrame | None:
+# Copies of the result files committed with the app, so a hosted deployment
+# (which has no data/processed/) can show the real 2019 results. Written by
+# export_demo_results(); data/processed/ always takes precedence.
+DEMO_RESULTS_DIR: Path = config.ROOT_DIR / "app" / "demo_results"
+
+
+def resolve_result_path(name: str) -> Path | None:
+    """Where one of RESULT_FILES can be read from: data/processed/ first,
+    then the bundled copy in DEMO_RESULTS_DIR; None if neither exists."""
+    path = Path(RESULT_FILES[name][0])
+    if path.exists():
+        return path
+    bundled = Path(DEMO_RESULTS_DIR) / path.name
+    return bundled if bundled.exists() else None
+
+
+def is_bundled(name: str) -> bool:
+    path = resolve_result_path(name)
+    return path is not None and path.parent == Path(DEMO_RESULTS_DIR)
+
+
+def load_result(name: str) -> pd.DataFrame | None:
     """Read one of RESULT_FILES, or return None if it has not been generated."""
-    path = (paths or {}).get(name, RESULT_FILES[name][0])
-    path = Path(path)
-    return pd.read_parquet(path) if path.exists() else None
+    path = resolve_result_path(name)
+    return pd.read_parquet(path) if path is not None else None
 
 
 def missing_file_message(name: str) -> str:
     path, command = RESULT_FILES[name]
     return f"`{path.name}` not found in `data/processed/`. Generate it with `{command}`."
+
+
+def export_demo_results(dest: Path | None = None) -> list[Path]:
+    """Copy the result files from data/processed/ into DEMO_RESULTS_DIR (or
+    dest) so they can be committed with the app for a hosted deployment.
+    Only the five dashboard result files are copied — never raw data."""
+    dest = Path(dest or DEMO_RESULTS_DIR)
+    dest.mkdir(parents=True, exist_ok=True)
+    written = []
+    for path, command in RESULT_FILES.values():
+        path = Path(path)
+        if not path.exists():
+            raise FileNotFoundError(f"{path} is missing; run `{command}` first")
+        target = dest / path.name
+        shutil.copy2(path, target)
+        written.append(target)
+    return written
+
+
+def main() -> None:
+    """python -m energy_dispatch.dashboard --export-demo-results"""
+    parser = argparse.ArgumentParser(description="Dashboard data utilities.")
+    parser.add_argument(
+        "--export-demo-results",
+        action="store_true",
+        help=f"Copy the dashboard result files into {DEMO_RESULTS_DIR} for deployment.",
+    )
+    args = parser.parse_args()
+    if not args.export_demo_results:
+        parser.print_help()
+        return
+    for target in export_demo_results():
+        print(f"Wrote {target} ({target.stat().st_size / 1e6:.1f} MB)")
 
 
 # ---------------------------------------------------------------------------
@@ -315,3 +370,7 @@ def what_if_day(
         }
     out["battery_savings_eur"] = out["off"]["realized_cost_eur"] - out["on"]["realized_cost_eur"]
     return out
+
+
+if __name__ == "__main__":
+    main()

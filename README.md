@@ -122,6 +122,22 @@ streamlit run app/streamlit_app.py
 pytest
 ```
 
+### Deploying the dashboard
+
+The hosted dashboard (Streamlit Community Cloud) has no access to
+`data/processed/`, so it reads a committed copy of the five result files
+from `app/demo_results/` (local files in `data/processed/` always take
+precedence). After running the pipeline locally:
+
+```bash
+python -m energy_dispatch.dashboard --export-demo-results   # copies results into app/demo_results/
+git add app/demo_results && git commit -m "Bundle dashboard results" && git push
+```
+
+Then create an app on [share.streamlit.io](https://share.streamlit.io) from
+this repository with main file `app/streamlit_app.py`. It installs the
+lightweight `requirements.txt` (no LightGBM or raw data needed).
+
 ## Forecasting design
 
 Day-ahead forecasting means one commitment, made at a single cutoff

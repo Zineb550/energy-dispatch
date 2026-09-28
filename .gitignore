@@ -22,3 +22,6 @@ reports/deck.pdf
 .DS_Store
 .vscode/
 .idea/
+
+# Local patch files exchanged during development
+/*.patch
