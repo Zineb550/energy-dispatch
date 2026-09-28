@@ -178,9 +178,10 @@ def page_overview() -> None:
         "forecasts Spain's hourly electricity demand (OPSD data), plans the next "
         "day's generation and battery dispatch with a linear program built on that "
         "forecast, and then settles the plan against the demand that actually "
-        "occurs. It asks two questions: **does a better forecast lower the cost of "
-        "operating the system**, and **how does the value of battery storage depend "
-        "on the flexibility of the generation fleet?**"
+        "occurs. It asks three questions: **does a better forecast lower the cost of "
+        "operating the system**, **can the forecast's uncertainty lower it further**, "
+        "and **how does the value of battery storage depend on the flexibility of the "
+        "generation fleet?**"
     )
     st.graphviz_chart(
         """
@@ -201,27 +202,54 @@ def page_overview() -> None:
     summary = require("scenario_summary")
     if summary is not None:
         head = dashboard.headline_metrics(summary)
-        st.subheader("Headline results (simulated 2019 system)")
+        planning = load("planning")
+        plan = dashboard.planning_headline(planning) if planning is not None else None
+        sens = load("sensitivity")
+        storage = dashboard.storage_headline(sens) if sens is not None else None
+
+        st.subheader("Three findings (simulated 2019 system)")
         c1, c2, c3 = st.columns(3)
-        c1.metric(
-            "LightGBM vs seasonal naive", eur(head["lightgbm_vs_naive"]["saving_eur"]) + "/yr"
-        )
-        c1.caption(
-            f"{head['lightgbm_vs_naive']['saving_pct']:.2f}% lower realized cost "
-            "(relative to the naive scenario)"
-        )
-        c2.metric("TSO vs LightGBM", eur(head["tso_vs_lightgbm"]["saving_eur"]) + "/yr")
-        c2.caption(
-            f"{head['tso_vs_lightgbm']['saving_pct']:.2f}% lower realized cost for the TSO "
-            "forecast (relative to the TSO scenario)"
-        )
-        c3.metric(
-            "Battery, baseline fleet (LightGBM plan)",
-            eur(head["battery_lightgbm"]["saving_eur"]) + "/yr",
-        )
-        c3.caption(
-            f"{head['battery_lightgbm']['saving_pct']:.2f}% of realized cost without the battery"
-        )
+        with c1:
+            st.markdown("**1 · Better forecasts lower operating cost**")
+            st.metric(
+                "LightGBM instead of seasonal naive",
+                "−" + eur(head["lightgbm_vs_naive"]["saving_eur"]) + "/yr",
+            )
+            st.caption(
+                f"{head['lightgbm_vs_naive']['saving_pct']:.2f}% lower realized cost. The "
+                f"TSO forecast is a further {eur(head['tso_vs_lightgbm']['saving_eur'])}/yr "
+                "cheaper."
+            )
+        with c2:
+            st.markdown("**2 · Deciding with the uncertainty saves more**")
+            if plan is not None:
+                st.metric(
+                    f"Plan on the {plan['target_quantile']:.0%} quantile, same model",
+                    "−" + eur(plan["saving_eur"]) + "/yr",
+                )
+                st.caption(
+                    f"{plan['saving_pct']:.2f}% lower realized cost than planning on the "
+                    "LightGBM point forecast: shortfalls cost more than surpluses."
+                )
+            else:
+                st.caption("Run `python -m energy_dispatch.planning` to show this result.")
+        with c3:
+            st.markdown("**3 · Storage value depends on the fleet**")
+            if storage is not None:
+                st.metric(
+                    f"Battery savings at a {storage['tight_ramp']:,.0f} MW/h CCGT ramp limit",
+                    eur(storage["tight_eur"]) + "/yr",
+                )
+                st.caption(
+                    f"{storage['tight_pct']:.2f}% of realized cost, against "
+                    f"{eur(storage['baseline_eur'])}/yr ({storage['baseline_pct']:.2f}%) in the "
+                    f"baseline fleet ({storage['baseline_ramp']:,.0f} MW/h)."
+                )
+            else:
+                st.metric(
+                    "Battery, baseline fleet (LightGBM plan)",
+                    eur(head["battery_lightgbm"]["saving_eur"]) + "/yr",
+                )
         st.caption(ILLUSTRATIVE_NOTE)
 
     st.subheader("How to read these results")
@@ -232,6 +260,10 @@ def page_overview() -> None:
         "actual − forecast whether or not the battery exists. The battery cannot "
         "absorb forecast error here; its value comes from reshaping the planned "
         "dispatch.\n"
+        "- **Uncertainty is an input to the decision.** Because a shortfall (€200/MWh) "
+        "costs more than a surplus (€20/MWh), planning slightly above the forecast, on a "
+        "quantile of the calibrated interval, lowers realized cost. See *Cost & forecast "
+        "value*.\n"
         "- **Storage value depends on the fleet.** See *Storage sensitivity*.\n"
         "- **Perfect foresight** plans on the actual load: a theoretical reference, "
         "not an achievable forecast.\n"

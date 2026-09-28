@@ -113,7 +113,7 @@ def export_demo_results(dest: Path | None = None) -> list[Path]:
     return written
 
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> None:
     """python -m energy_dispatch.dashboard --export-demo-results"""
     parser = argparse.ArgumentParser(description="Dashboard data utilities.")
     parser.add_argument(
@@ -121,7 +121,7 @@ def main() -> None:
         action="store_true",
         help=f"Copy the dashboard result files into {DEMO_RESULTS_DIR} for deployment.",
     )
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     if not args.export_demo_results:
         parser.print_help()
         return
@@ -286,6 +286,37 @@ def cost_above_reference(summary: pd.DataFrame, battery: str = "off") -> pd.Data
     out = out.drop(index="perfect_foresight", errors="ignore")
     out.index = out.index.map(FORECAST_LABELS)
     return out
+
+
+def planning_headline(planning: pd.DataFrame) -> dict | None:
+    """Saving of the pre-registered tau* plan against the point-forecast plan."""
+    star = planning[planning["is_theoretical_optimum"].fillna(False).astype(bool)]
+    if star.empty:
+        return None
+    row = star.iloc[0]
+    return {
+        "target_quantile": float(row["target_quantile"]),
+        "saving_eur": float(row["saving_vs_point_plan_eur"]),
+        "saving_pct": float(row["saving_vs_point_plan_pct"]),
+    }
+
+
+def storage_headline(results: pd.DataFrame, forecast_method: str = "lightgbm") -> dict | None:
+    """Battery savings in the baseline fleet and at the tightest CCGT ramp
+    limit tested (the sensitivity's strongest lever)."""
+    view = sensitivity_view(results, "ccgt_ramp_mw_per_hour", forecast_method)
+    base = view[view["is_baseline"]]
+    if view.empty or base.empty:
+        return None
+    tight = view.iloc[0]  # sorted by value: the tightest ramp limit first
+    return {
+        "baseline_eur": float(base["battery_savings_eur"].iloc[0]),
+        "baseline_pct": float(base["battery_savings_pct"].iloc[0]),
+        "baseline_ramp": float(base["value"].iloc[0]),
+        "tight_eur": float(tight["battery_savings_eur"]),
+        "tight_pct": float(tight["battery_savings_pct"]),
+        "tight_ramp": float(tight["value"]),
+    }
 
 
 def planning_view(planning: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:

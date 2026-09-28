@@ -155,6 +155,29 @@ def test_dm_view_is_readable_and_flags_significance(results):
     assert set(cost["Lower loss"]) <= set(dashboard.FORECAST_LABELS.values())
 
 
+def test_overview_headlines_for_planning_and_storage(results):
+    frames, _ = results
+    plan = dashboard.planning_headline(frames["planning"])
+    star = frames["planning"][frames["planning"]["is_theoretical_optimum"]]
+    if star.empty:  # tau* not in this fixture's grid (0.5, 0.8)
+        assert plan is None
+    storage = dashboard.storage_headline(frames["sensitivity"])
+    ramp = dashboard.sensitivity_view(frames["sensitivity"], "ccgt_ramp_mw_per_hour")
+    assert storage["tight_ramp"] == ramp["value"].min() == 1_000
+    assert storage["baseline_ramp"] == 8_000
+    assert storage["tight_eur"] == pytest.approx(ramp["battery_savings_eur"].iloc[0])
+
+
+def test_planning_headline_reports_tau_star():
+    table = pd.DataFrame(
+        {"target_quantile": [0.5, 0.778, None], "is_theoretical_optimum": [False, True, False],
+         "saving_vs_point_plan_eur": [0.0, 7.6e7, 1.5e8],
+         "saving_vs_point_plan_pct": [0.0, 0.92, 1.87]}
+    )  # fmt: skip
+    head = dashboard.planning_headline(table)
+    assert head == {"target_quantile": 0.778, "saving_eur": 7.6e7, "saving_pct": 0.92}
+
+
 def test_planning_view_separates_plans_and_references(results):
     frames, _ = results
     plans, references = dashboard.planning_view(frames["planning"])

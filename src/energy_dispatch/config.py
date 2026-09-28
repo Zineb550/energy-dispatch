@@ -236,9 +236,15 @@ class GenerationUnit:
 
 
 GENERATION_UNITS: tuple[GenerationUnit, ...] = (
-    GenerationUnit("baseload", capacity_mw=7_000, marginal_cost_eur_per_mwh=10, ramp_limit_mw_per_hour=1_000),
-    GenerationUnit("ccgt", capacity_mw=25_000, marginal_cost_eur_per_mwh=60, ramp_limit_mw_per_hour=8_000),
-    GenerationUnit("peaker", capacity_mw=10_000, marginal_cost_eur_per_mwh=120, ramp_limit_mw_per_hour=None),
+    GenerationUnit(
+        "baseload", capacity_mw=7_000, marginal_cost_eur_per_mwh=10, ramp_limit_mw_per_hour=1_000
+    ),
+    GenerationUnit(
+        "ccgt", capacity_mw=25_000, marginal_cost_eur_per_mwh=60, ramp_limit_mw_per_hour=8_000
+    ),
+    GenerationUnit(
+        "peaker", capacity_mw=10_000, marginal_cost_eur_per_mwh=120, ramp_limit_mw_per_hour=None
+    ),
 )
 
 # Solar + wind: marginal cost 0, output capped at actual observed generation
