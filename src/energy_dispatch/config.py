@@ -27,6 +27,7 @@ FORECAST_TABLE_PARQUET = PROCESSED_DATA_DIR / "forecast_test_period.parquet"
 METRICS_TABLE_PARQUET = PROCESSED_DATA_DIR / "forecast_metrics.parquet"
 SCENARIO_RESULTS_PARQUET = PROCESSED_DATA_DIR / "scenario_results.parquet"
 EVALUATION_HOURLY_PARQUET = PROCESSED_DATA_DIR / "evaluation_hourly.parquet"
+SENSITIVITY_RESULTS_PARQUET = PROCESSED_DATA_DIR / "sensitivity_results.parquet"
 
 # ---------------------------------------------------------------------------
 # Data source
@@ -272,6 +273,14 @@ HOURS_PER_DAY = 24
 # Sensitivity sweeps
 # ---------------------------------------------------------------------------
 
-BATTERY_POWER_SWEEP_MW = (0, 250, 500, 1_000, 2_000, 4_000)
-BALANCING_PRICE_UP_SWEEP_EUR_PER_MWH = (50, 100, 200, 400, 800)
+# One-factor-at-a-time grids around the baseline system above (see
+# sensitivity.py). Each grid includes its baseline value; every other
+# parameter stays at baseline while one varies. Illustrative, like the
+# system itself — not Spanish market data.
+BATTERY_POWER_SWEEP_MW = (500, 1_000, 2_000, 4_000)
+BATTERY_ENERGY_SWEEP_MWH = (1_000, 4_000, 8_000, 16_000)
+CCGT_RAMP_SWEEP_MW_PER_HOUR = (1_000, 2_000, 4_000, 8_000)
+CCGT_CAPACITY_SWEEP_MW = (15_000, 20_000, 25_000)
+PEAKER_COST_SWEEP_EUR_PER_MWH = (100, 120, 180, 250)
+BALANCING_PRICE_SWEEP_EUR_PER_MWH = ((150, 50), (200, 20), (300, 10))  # (up, down)
 RENEWABLE_SCALE_SWEEP = (0.5, 1.0, 1.5, 2.0)  # multiplier on observed solar+wind

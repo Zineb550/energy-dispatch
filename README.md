@@ -4,9 +4,14 @@
 How much can it save by (a) forecasting demand more accurately and
 (b) operating battery storage optimally?
 
-**Headline result:** _TBD — filled in once the full pipeline has run
-(spec section 7.4: savings from better forecasting, savings from the
-battery, and the combined effect, in €/year and %)._
+**Headline result** (simulated 2019 system with illustrative costs, see
+[Results](#results)): planning with the LightGBM forecast instead of a
+seasonal-naive one lowers realized operating cost by **€604.3M/year
+(6.80%)**. The TSO's own forecast is a further €155.2M/year (1.91%)
+cheaper. A 1,000 MW / 4,000 MWh battery saves only ~€3.5M/year (0.04%)
+in the baseline fleet. That value depends strongly on how flexible the
+thermal fleet is: it rises to €192.9M/year (2.24%) when the CCGT ramp
+limit is tightened from 8,000 to 1,000 MW/h.
 
 ## Architecture
 
@@ -105,6 +110,7 @@ python -m energy_dispatch.data
 python -m energy_dispatch.forecast   # writes data/processed/forecast_test_period.parquet
 python -m energy_dispatch.evaluate   # dispatch + realized cost -> scenario_results.parquet
                                      # (add --max-days 7 for a quick smoke run)
+python -m energy_dispatch.sensitivity   # battery value vs. fleet parameters -> sensitivity_results.parquet
 
 # 2. Run the full pipeline (forecast backtest -> dispatch -> evaluation)
 python -m energy_dispatch.pipeline
@@ -237,15 +243,128 @@ uncalibrated candidate tried in the hyperparameter sweep (previously as
 low as 155.3/121.7), so this isn't a coverage-vs-accuracy trade-off, it's
 a straightforward improvement on both axes.
 
-The realized-cost scenario comparison (see "Evaluation design" above) is
-still _TBD_. It will be filled in once `python -m energy_dispatch.evaluate`
-has been run on the real 2019 test year.
+### Economic value of forecasting
+
+**Does better demand forecasting have economic value when the forecast is
+used to make dispatch decisions?** In this simulated system, yes, and the
+ordering of realized cost follows the ordering of forecast accuracy.
+
+Real 2019 evaluation (`python -m energy_dispatch.evaluate`), battery off,
+364 days / 8,736 hours. 2019-12-24 is excluded from every scenario
+because its solar/wind data is missing.
+
+| Planning forecast | Forecast MAE (MW) | Planned cost | Imbalance cost | **Realized cost** | Imbalance energy |
+|---|---|---|---|---|---|
+| Perfect foresight (reference) | 0 | €7.917B | €0.0M | **€7.917B** | 0 TWh |
+| TSO (ENTSO-E) | 272.5 | €7.921B | €208.5M | **€8.130B** | 2.38 TWh |
+| LightGBM | 491.7 | €7.937B | €348.0M | **€8.285B** | 4.30 TWh |
+| Seasonal naive | 1,238.2 | €7.923B | €965.8M | **€8.889B** | 10.82 TWh |
+
+(MAE here is over the evaluated days only, so it differs slightly from
+the full-year forecast table above.)
+
+- **LightGBM vs seasonal naive:** €604.3M/year lower realized cost (6.80%
+  of the naive scenario's realized cost).
+- **TSO vs LightGBM:** the TSO forecast is €155.2M/year cheaper (1.91% of
+  the TSO scenario's realized cost),
+  consistent with its lower forecast error (MAE 272.7 vs 500.0 MW over the
+  full test year).
+- **Perfect foresight** plans on the actual load, so it is a theoretical
+  lower bound, not an achievable forecast. LightGBM is €367.8M (4.65%)
+  above it, and TSO is €212.6M (2.69%) above it.
+
+Forecast accuracy is not the same thing as economic value. The planned
+cost column alone would rank the forecasts wrongly: LightGBM has the
+*highest* planned cost, because it over-forecasts slightly on average
+(mean bias −40 MW) and so schedules more generation. What separates the
+forecasts is the imbalance settled after actual demand is revealed.
+Shortfalls cost €200/MWh while surpluses only earn €20/MWh, so the size
+of the forecast error, not the plan, drives realized cost.
+
+### Storage in the baseline system
+
+With the configured 1,000 MW / 4,000 MWh battery, realized cost falls by
+€3.0–3.5M/year (about 0.04%) whichever forecast is used: €3.04M with
+perfect foresight, €3.42M with naive, €3.38M with TSO and €3.48M with
+LightGBM. Almost all of that saving is planned generation cost. The
+imbalance cost is the same with and without the battery.
+
+This is a consequence of the model, not a general statement about
+batteries:
+
+- The day-ahead plan is fixed and there is no real-time re-dispatch, so
+  imbalance = actual load − forecast load whether or not a battery
+  exists. The battery cannot absorb forecast error here.
+- Its only lever is intertemporal arbitrage inside the plan: charging when
+  cheap generation has headroom and discharging to avoid expensive
+  generation. In the baseline fleet, baseload + CCGT provide 32,000 MW and
+  the CCGT can ramp 8,000 MW/h, so little expensive peaker output is left
+  to displace. Over the year the battery cuts peaker generation from
+  134.3 GWh to 72.8 GWh.
+
+### Storage value vs. generation-fleet flexibility
+
+**How does storage value depend on the flexibility of the generation
+system?** Strongly. `python -m energy_dispatch.sensitivity` varies one
+parameter at a time around the baseline (LightGBM forecast, same 364
+days) and measures battery savings = realized cost without battery −
+realized cost with battery.
+
+| Parameter varied | Values tested | Battery savings (% of realized cost without battery) |
+|---|---|---|
+| CCGT ramp limit (MW/h) | 1,000 / 2,000 / 4,000 / **8,000** | €192.9M (2.24%) / €66.6M (0.80%) / €6.3M (0.08%) / **€3.5M (0.04%)** |
+| CCGT capacity (MW) | 15,000* / 20,000 / **25,000** | €45.9M (0.56%)* / €22.5M (0.27%) / **€3.5M (0.04%)** |
+| Peaker cost (€/MWh) | 100 / **120** / 180 / 250 | €2.2M (0.03%) / **€3.5M (0.04%)** / €7.2M (0.09%) / €11.5M (0.14%) |
+| Battery power (MW) | 500 / **1,000** / 2,000 / 4,000 | €2.3M / **€3.5M** / €4.0M / €4.0M |
+| Battery energy (MWh) | 1,000 / **4,000** / 8,000 / 16,000 | €1.3M / **€3.5M** / €3.9M / €4.1M |
+| Balancing prices up/down (€/MWh) | 150/50 / **200/20** / 300/10 | €3.5M in all three cases |
+
+Baseline values are in **bold**. \*The 15,000 MW CCGT fleet cannot meet
+demand on 21 days, and the LP has no load-shedding option, so that row
+covers 343 days. It is not directly comparable to the others. The
+20,000 MW row covers all 364 days.
+
+- **Ramp flexibility is the main driver.** Tightening the CCGT ramp limit
+  from 8,000 to 1,000 MW/h raises battery savings about 55-fold. At
+  1,000 MW/h the system needs 3.22 TWh of peaker output to follow demand,
+  and the battery cuts that to 1.22 TWh.
+- **CCGT capacity works through the same mechanism.** Less CCGT means more
+  peaker hours for the battery to displace (€22.5M at 20,000 MW, all days
+  feasible).
+- **Peaker cost scales the saving almost linearly.** The battery displaces
+  the same ~61.5 GWh of peaker output at every tested price, so the saving
+  grows with the gap between peaker and CCGT cost.
+- **A bigger battery alone adds little in the baseline fleet.** Savings
+  level off near €4M: the fleet, not battery size, limits the arbitrage
+  opportunity.
+- **Balancing prices leave battery savings unchanged**, as the model
+  implies: they change what imbalance costs, but imbalance does not depend
+  on the battery. This is a consistency check, not an economic finding.
+
+### What these results do and do not show
+
+The numbers come from a simplified single-node system whose capacities,
+marginal costs, ramp limits, battery parameters and balancing prices are
+illustrative assumptions (see `config.py`). They are not a calibrated
+model of the Spanish electricity market, and the euro amounts should not
+be read as Spanish market savings. The forecasting model uses observed
+target-hour weather as a proxy for weather forecasts, and dispatch
+planning uses observed solar and wind output (perfect renewable
+foresight). This isolates the demand-forecasting question but makes both
+the forecast and the plan somewhat easier than in practice. What the
+results do show is the mechanism: forecast quality changes dispatch
+decisions and imbalance, and hence realized cost. Storage value depends
+on how much inflexible, expensive generation there is to avoid.
 
 ## Assumptions and limitations
 
 - **Generation costs and capacities are illustrative**, not real market
-  data (see `config.py` — baseload/CCGT/peaker capacities and marginal
-  costs, battery specs, balancing market prices).
+  data (see `config.py` — baseload/CCGT/peaker capacities, marginal
+  costs and ramp limits, battery specs, balancing market prices).
+- The 2019 evaluation excludes 2019-12-24, whose solar/wind data is
+  missing in the OPSD dataset; the same 364 days are used in every
+  scenario and sensitivity run (except the 15,000 MW CCGT variant, which
+  cannot meet demand on 21 of them).
 - Day-ahead weather **forecasts** are not available in the OPSD dataset;
   observed weather is used as a proxy feature, which overstates the
   accuracy achievable with a real weather forecast.

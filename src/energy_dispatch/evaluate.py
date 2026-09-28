@@ -260,6 +260,7 @@ def evaluate_year(
     start: str | None = None,
     end: str | None = None,
     max_days: int | None = None,
+    availability_forecast_cols: tuple[str, ...] | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Evaluate every (forecast scenario x battery scenario) pair, one
     day-ahead LP per local day.
@@ -269,9 +270,23 @@ def evaluate_year(
     local_date, and everything evaluate_day returns. A day whose LP is not
     solvable for any scenario is skipped for all scenarios (and reported)
     so every scenario covers exactly the same hours.
+
+    availability_forecast_cols overrides which columns select_evaluable_days
+    checks for completeness. Default (None) checks tuple(scenarios.values())
+    as before. Pass the full forecast-scenario column set explicitly when
+    evaluating a *subset* of scenarios (e.g. sensitivity.py running one
+    forecast at a time) so the day-availability check doesn't loosen just
+    because fewer columns are in play — otherwise two runs over different
+    scenario subsets could silently end up evaluating different samples.
     """
     valid_days, skipped_df = select_evaluable_days(
-        forecast_table, renewable_available, tuple(scenarios.values()), start=start, end=end
+        forecast_table,
+        renewable_available,
+        availability_forecast_cols
+        if availability_forecast_cols is not None
+        else tuple(scenarios.values()),
+        start=start,
+        end=end,
     )
     if max_days is not None:
         valid_days = valid_days[:max_days]
