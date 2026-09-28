@@ -172,9 +172,23 @@ bug: ENTSO-E's forecast has structural advantages this model doesn't
 this project's weather-proxy assumption above, which should if anything
 flatter our model relative to a real forecast-error scenario.
 
-Interval metrics (q10/q90) and the dispatch-optimization scenario
-comparison are still _TBD_ — filled in once conformal calibration's
-real-data numbers and the optimization module are run.
+Interval metrics (q10/q90), same backtest, with split-conformal
+calibration applied:
+
+| Metric | Value |
+|---|---|
+| Coverage (target 80%) | **78.8%** |
+| Avg. interval width | 1672 MW |
+| Pinball loss (low / high) | 146.6 / 118.1 |
+
+Calibration essentially closed the gap (56% → 78.8%, against an 80%
+target) — and did so while *lowering* pinball loss versus every
+uncalibrated candidate tried in the hyperparameter sweep (previously as
+low as 155.3/121.7), so this isn't a coverage-vs-accuracy trade-off, it's
+a straightforward improvement on both axes.
+
+The dispatch-optimization scenario comparison is still _TBD_ — filled in
+once `optimize.py` is implemented.
 
 ## Assumptions and limitations
 
