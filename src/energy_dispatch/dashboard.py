@@ -51,9 +51,14 @@ RESULT_FILES: dict[str, tuple[Path, str]] = {
     "scenario_summary": (config.SCENARIO_RESULTS_PARQUET, "python -m energy_dispatch.evaluate"),
     "sensitivity": (config.SENSITIVITY_RESULTS_PARQUET, "python -m energy_dispatch.sensitivity"),
     "planning": (config.PLANNING_RESULTS_PARQUET, "python -m energy_dispatch.planning"),
+    "dm_tests": (config.DM_TESTS_PARQUET, "python -m energy_dispatch.diagnostics"),
+    "error_breakdown": (config.ERROR_BREAKDOWN_PARQUET, "python -m energy_dispatch.diagnostics"),
+    "shap_importance": (config.SHAP_IMPORTANCE_PARQUET, "python -m energy_dispatch.diagnostics"),
 }
 # Extensions whose page section is simply hidden when the file is absent.
-OPTIONAL_RESULTS: frozenset[str] = frozenset({"planning"})
+OPTIONAL_RESULTS: frozenset[str] = frozenset(
+    {"planning", "dm_tests", "error_breakdown", "shap_importance"}
+)
 
 
 # Copies of the result files committed with the app, so a hosted deployment
@@ -290,6 +295,40 @@ def planning_view(planning: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
     references = planning[planning["target_quantile"].isna()].copy()
     references["label"] = references["forecast_method"].map(FORECAST_LABELS)
     return plans.reset_index(drop=True), references.reset_index(drop=True)
+
+
+def _dm_label(name: str) -> str:
+    if name in FORECAST_COLUMN_LABELS:
+        return FORECAST_COLUMN_LABELS[name]
+    if name in FORECAST_LABELS:
+        return FORECAST_LABELS[name]
+    if name.startswith("lightgbm_q"):
+        return "LightGBM point plan" if name == "lightgbm_q50" else f"LightGBM {name[10:]}% plan"
+    return name
+
+
+def dm_view(dm: pd.DataFrame, test: str) -> pd.DataFrame:
+    """Readable Diebold-Mariano results for one test family
+    ("forecast_error" or "realized_cost")."""
+    rows = dm[dm["test"] == test]
+    better = [
+        _dm_label(a if lower == "a" else b)
+        for a, b, lower in zip(rows["model_a"], rows["model_b"], rows["lower_loss"], strict=True)
+    ]
+    return pd.DataFrame(
+        {
+            "Comparison": [
+                f"{_dm_label(a)} vs {_dm_label(b)}"
+                for a, b in zip(rows["model_a"], rows["model_b"], strict=True)
+            ],
+            "Loss": rows["loss"].to_numpy(),
+            "Lower loss": better,
+            "Mean difference (a − b)": rows["mean_loss_difference"].to_numpy(),
+            "DM statistic": rows["dm_statistic"].to_numpy(),
+            "p-value": rows["p_value"].to_numpy(),
+            "Significant at 5%": (rows["p_value"] < 0.05).to_numpy(),
+        }
+    )
 
 
 def battery_value_by_forecast(summary: pd.DataFrame) -> pd.DataFrame:

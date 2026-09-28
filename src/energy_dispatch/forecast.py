@@ -40,6 +40,7 @@ from __future__ import annotations
 import argparse
 import logging
 from collections.abc import Callable
+from statistics import NormalDist
 
 import numpy as np
 import pandas as pd
@@ -49,6 +50,7 @@ from energy_dispatch import config, features
 # ---------------------------------------------------------------------------
 # Baselines
 # ---------------------------------------------------------------------------
+
 
 def seasonal_naive_forecast(
     df: pd.DataFrame, target_col: str = config.LOAD_ACTUAL_COL
@@ -80,6 +82,7 @@ def tso_forecast(df: pd.DataFrame) -> pd.Series:
 # ---------------------------------------------------------------------------
 # LightGBM point model
 # ---------------------------------------------------------------------------
+
 
 def prepare_training_frame(
     feature_matrix: pd.DataFrame, target_col: str = config.LOAD_ACTUAL_COL
@@ -299,6 +302,7 @@ def make_conformalized_quantile_predict_fn(
 # ---------------------------------------------------------------------------
 # Time-based splits
 # ---------------------------------------------------------------------------
+
 
 def time_based_split(df: pd.DataFrame) -> dict[str, pd.DataFrame]:
     """Split df into train/validation/test/stress_test by the *local*
@@ -559,6 +563,7 @@ def sweep_quantile_params(
 # Point metrics
 # ---------------------------------------------------------------------------
 
+
 def compute_point_metrics(
     forecast_table: pd.DataFrame,
     model_cols: tuple[str, ...] = ("y_naive", "y_tso"),
@@ -659,34 +664,187 @@ def compute_interval_metrics(
 # ---------------------------------------------------------------------------
 
 
-def error_breakdown(forecast_table: pd.DataFrame) -> pd.DataFrame:
-    """Error metrics sliced by hour, season, holiday flag, and extreme-
-    temperature days.
+POINT_FORECAST_COLS: tuple[str, ...] = ("y_naive", "y_tso", "y_lgbm")
 
-    Deliberately not implemented yet — revisit once there's a model worth
-    slicing (the two baselines can already be sliced with
-    compute_point_metrics per-subset if useful sooner).
+
+def day_type(index: pd.DatetimeIndex) -> pd.Series:
+    """'holiday' (Spanish national holiday), 'weekend' or 'weekday' for each
+    UTC timestamp, judged on its Europe/Madrid calendar day."""
+    from holidays import country_holidays
+
+    local = index.tz_convert(config.LOCAL_TZ)
+    national = country_holidays(config.HOLIDAY_COUNTRY, years=sorted(set(local.year)))
+    kinds = [
+        "holiday" if ts.date() in national else ("weekend" if ts.weekday() >= 5 else "weekday")
+        for ts in local
+    ]
+    return pd.Series(kinds, index=index, name="day_type")
+
+
+def error_breakdown(
+    forecast_table: pd.DataFrame,
+    model_cols: tuple[str, ...] = POINT_FORECAST_COLS,
+    true_col: str = "y_true",
+) -> pd.DataFrame:
+    """Point-forecast error sliced by local hour of day, day type
+    (weekday / weekend / national holiday) and month.
+
+    Long format: one row per (slice, group, model) with mae, bias (mean of
+    actual - forecast, so positive = under-forecast) and n. Rows where the
+    actual or that model's forecast is missing are left out for that model.
     """
-    raise NotImplementedError("deferred alongside LightGBM")
+    local = forecast_table.index.tz_convert(config.LOCAL_TZ)
+    slices = {
+        "hour": pd.Series(local.hour, index=forecast_table.index),
+        "day_type": day_type(forecast_table.index),
+        "month": pd.Series(local.month, index=forecast_table.index),
+    }
+    rows = []
+    for model in model_cols:
+        if model not in forecast_table.columns:
+            continue
+        error = (forecast_table[true_col] - forecast_table[model]).dropna()
+        for slice_name, keys in slices.items():
+            grouped = error.groupby(keys.reindex(error.index))
+            for group, errors in grouped:
+                rows.append(
+                    {
+                        "slice": slice_name,
+                        "group": str(group),
+                        "model": model,
+                        "mae": float(errors.abs().mean()),
+                        "bias": float(errors.mean()),
+                        "n": int(errors.size),
+                    }
+                )
+    return pd.DataFrame(rows)
 
 
-def shap_feature_importance(model, X: pd.DataFrame):
-    """SHAP values for the LightGBM point model.
+def shap_feature_importance(model, X: pd.DataFrame, max_rows: int = 5_000) -> pd.DataFrame:
+    """Global feature importance of a fitted LightGBM model as the mean
+    absolute SHAP value per feature (in MW), using LightGBM's exact
+    TreeSHAP (predict(pred_contrib=True)), so no extra dependency is needed.
 
-    fit_lightgbm_point now exists, but this is still deliberately not
-    implemented yet — deferred to a later step, not blocked on anything.
+    For each row, the SHAP values plus the model's base value add up to its
+    prediction. Explains at most `max_rows` rows (a fixed random sample,
+    for speed). Returns feature, mean_abs_shap_mw, share_pct (of the total)
+    and mean_shap_mw (signed average contribution), most important first.
     """
-    raise NotImplementedError("deferred to a later step")
+    sample = X.sample(max_rows, random_state=config.RANDOM_SEED) if len(X) > max_rows else X
+    contributions = np.asarray(model.predict(sample, pred_contrib=True))
+    values = pd.DataFrame(contributions[:, :-1], columns=sample.columns, index=sample.index)
+    mean_abs = values.abs().mean()
+    table = pd.DataFrame(
+        {
+            "feature": mean_abs.index,
+            "mean_abs_shap_mw": mean_abs.to_numpy(),
+            "share_pct": (mean_abs / mean_abs.sum() * 100).to_numpy(),
+            "mean_shap_mw": values.mean().to_numpy(),
+        }
+    )
+    return table.sort_values("mean_abs_shap_mw", ascending=False, ignore_index=True)
 
 
-def diebold_mariano_test(errors_a: pd.Series, errors_b: pd.Series) -> dict:
-    """Diebold-Mariano test for whether two models' errors differ
-    significantly.
-
-    Deliberately not implemented yet — deferred to a later step, alongside
-    the quantile models.
+def fit_model_for_explanation(
+    feature_matrix: pd.DataFrame,
+    target_col: str = config.LOAD_ACTUAL_COL,
+    test_start: str = config.TEST_START,
+    test_end: str = config.TEST_END,
+):
+    """Fit the LightGBM point model the backtest uses for its first test
+    block (every row whose forecast origin is before the first test day's
+    origin) and return (model, X_test): the test-period feature rows to
+    explain. Mirrors rolling_origin_backtest's training rule, so the
+    explained model saw no test-period data.
     """
-    raise NotImplementedError("deferred to a later step")
+    local_date = feature_matrix.index.tz_convert(config.LOCAL_TZ).normalize()
+    first_test_day = pd.Timestamp(test_start, tz=config.LOCAL_TZ)
+    first_origin = features.compute_forecast_origin(pd.DatetimeIndex([first_test_day]))[0]
+    train = prepare_training_frame(
+        feature_matrix[feature_matrix["origin_utc"] < first_origin], target_col
+    )
+    feature_cols = features.select_feature_columns(train)
+    model = fit_lightgbm_point(train[feature_cols], train[target_col])
+    in_test = (local_date >= first_test_day) & (
+        local_date <= pd.Timestamp(test_end, tz=config.LOCAL_TZ)
+    )
+    return model, feature_matrix.loc[in_test, feature_cols]
+
+
+def dm_test_on_losses(loss_a: pd.Series, loss_b: pd.Series, max_lag: int = 168) -> dict:
+    """Diebold-Mariano test on two aligned loss series (any loss: squared
+    error, absolute error, or hourly realized cost).
+
+    d_t = loss_a_t - loss_b_t; H0: E[d_t] = 0. The variance of the mean of
+    d uses a Newey-West (Bartlett kernel) estimator with `max_lag` lags,
+    because hourly day-ahead losses are strongly autocorrelated: all hours
+    of a day share one forecast origin, and errors persist across days. The
+    default of 168 lags (one week) is deliberately conservative. The
+    p-value is two-sided, from the standard normal distribution.
+
+    mean_loss_difference < 0 means model a has the lower loss.
+    """
+    d = (loss_a - loss_b).dropna().to_numpy(dtype=float)
+    n = d.size
+    if n < 2:
+        raise ValueError("need at least two aligned observations")
+    mean = d.mean()
+    centred = d - mean
+    variance = centred @ centred / n
+    for lag in range(1, min(max_lag, n - 1) + 1):
+        weight = 1 - lag / (max_lag + 1)
+        variance += 2 * weight * (centred[lag:] @ centred[:-lag]) / n
+    if variance <= 0:  # the difference is constant: no noise to test against
+        statistic = 0.0 if mean == 0 else float(np.copysign(np.inf, mean))
+        p_value = 1.0 if mean == 0 else 0.0
+    else:
+        statistic = mean / np.sqrt(variance / n)
+        p_value = 2 * (1 - NormalDist().cdf(abs(statistic)))
+    return {
+        "mean_loss_difference": float(mean),
+        "dm_statistic": float(statistic),
+        "p_value": float(p_value),
+        "n": int(n),
+        "max_lag": int(max_lag),
+        "lower_loss": "a" if mean < 0 else "b",
+    }
+
+
+def diebold_mariano_test(
+    errors_a: pd.Series, errors_b: pd.Series, loss: str = "squared", max_lag: int = 168
+) -> dict:
+    """Diebold-Mariano test of whether two forecasts' errors differ
+    significantly, on squared (default) or absolute error. See
+    dm_test_on_losses for the statistic and its HAC variance.
+    """
+    if loss == "squared":
+        return dm_test_on_losses(errors_a**2, errors_b**2, max_lag)
+    if loss == "absolute":
+        return dm_test_on_losses(errors_a.abs(), errors_b.abs(), max_lag)
+    raise ValueError(f"loss must be 'squared' or 'absolute', got {loss!r}")
+
+
+def forecast_dm_table(
+    forecast_table: pd.DataFrame,
+    pairs: tuple[tuple[str, str], ...] = (
+        ("y_lgbm", "y_naive"),
+        ("y_tso", "y_lgbm"),
+        ("y_tso", "y_naive"),
+    ),
+    losses: tuple[str, ...] = ("squared", "absolute"),
+    true_col: str = "y_true",
+    max_lag: int = 168,
+) -> pd.DataFrame:
+    """Diebold-Mariano tests for each (model_a, model_b) pair and loss."""
+    rows = []
+    for a, b in pairs:
+        errors_a = forecast_table[true_col] - forecast_table[a]
+        errors_b = forecast_table[true_col] - forecast_table[b]
+        for loss in losses:
+            result = diebold_mariano_test(errors_a, errors_b, loss=loss, max_lag=max_lag)
+            rows.append({"test": "forecast_error", "model_a": a, "model_b": b, "loss": loss,
+                         **result})  # fmt: skip
+    return pd.DataFrame(rows)
 
 
 # ---------------------------------------------------------------------------
@@ -809,9 +967,7 @@ def run_full_backtest(
                 forecast_table[col] = quantile_table[col]
         interval_metrics = compute_interval_metrics(forecast_table)
 
-    metrics_table = compute_point_metrics(
-        forecast_table, model_cols=("y_naive", "y_tso", "y_lgbm")
-    )
+    metrics_table = compute_point_metrics(forecast_table, model_cols=("y_naive", "y_tso", "y_lgbm"))
     return forecast_table, metrics_table, interval_metrics
 
 

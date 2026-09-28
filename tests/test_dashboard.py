@@ -12,7 +12,15 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
-from energy_dispatch import config, dashboard, evaluate, forecast, planning, sensitivity
+from energy_dispatch import (
+    config,
+    dashboard,
+    diagnostics,
+    evaluate,
+    forecast,
+    planning,
+    sensitivity,
+)
 
 APP = Path(__file__).resolve().parents[1] / "app" / "streamlit_app.py"
 DAYS = ["2019-01-22", "2019-06-12"]
@@ -66,6 +74,19 @@ def results(tmp_path_factory):
         "scenario_summary": summary,
         "sensitivity": sens,
         "planning": planning.uncertainty_aware_plan(table, renewable, quantiles=(0.5, 0.8))[0],
+        "dm_tests": pd.concat(
+            [forecast.forecast_dm_table(table), diagnostics.cost_dm_table(hourly)],
+            ignore_index=True,
+        ),
+        "error_breakdown": forecast.error_breakdown(table),
+        "shap_importance": pd.DataFrame(
+            {
+                "feature": ["lag_24h", "hour", "temperature"],
+                "mean_abs_shap_mw": [900.0, 400.0, 100.0],
+                "share_pct": [64.3, 28.6, 7.1],
+                "mean_shap_mw": [5.0, -2.0, 1.0],
+            }
+        ),  # fmt: skip
     }
     folder = tmp_path_factory.mktemp("processed")
     paths = {}
@@ -123,6 +144,15 @@ def test_export_skips_optional_results_that_were_not_generated(tmp_path, results
     point_app_at(without_planning)
     written = dashboard.export_demo_results(tmp_path / "demo")
     assert len(written) == len(dashboard.RESULT_FILES) - 1
+
+
+def test_dm_view_is_readable_and_flags_significance(results):
+    frames, _ = results
+    view = dashboard.dm_view(frames["dm_tests"], "forecast_error")
+    assert "LightGBM vs Seasonal naive" in set(view["Comparison"])
+    assert view["Significant at 5%"].dtype == bool
+    cost = dashboard.dm_view(frames["dm_tests"], "realized_cost")
+    assert set(cost["Lower loss"]) <= set(dashboard.FORECAST_LABELS.values())
 
 
 def test_planning_view_separates_plans_and_references(results):
@@ -244,6 +274,8 @@ def test_every_page_renders_with_results(results, point_app_at):
 
     app.sidebar.radio[0].set_value("Cost & forecast value").run()
     assert any("forecast interval" in h.value for h in app.subheader)
+    app.sidebar.radio[0].set_value("Forecast").run()
+    assert any("Forecast diagnostics" in h.value for h in app.subheader)
 
     app.sidebar.radio[0].set_value("What-if").run()
     # What-if: submitting the form solves the LP and shows the comparison

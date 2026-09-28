@@ -29,6 +29,9 @@ SCENARIO_RESULTS_PARQUET = PROCESSED_DATA_DIR / "scenario_results.parquet"
 EVALUATION_HOURLY_PARQUET = PROCESSED_DATA_DIR / "evaluation_hourly.parquet"
 SENSITIVITY_RESULTS_PARQUET = PROCESSED_DATA_DIR / "sensitivity_results.parquet"
 PLANNING_RESULTS_PARQUET = PROCESSED_DATA_DIR / "planning_results.parquet"
+DM_TESTS_PARQUET = PROCESSED_DATA_DIR / "dm_tests.parquet"
+ERROR_BREAKDOWN_PARQUET = PROCESSED_DATA_DIR / "error_breakdown.parquet"
+SHAP_IMPORTANCE_PARQUET = PROCESSED_DATA_DIR / "shap_importance.parquet"
 
 # ---------------------------------------------------------------------------
 # Data source

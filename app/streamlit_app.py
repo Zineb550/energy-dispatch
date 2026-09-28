@@ -303,6 +303,68 @@ def page_forecast() -> None:
         "forecast. LightGBM uses observed target-hour weather as a proxy for a "
         "weather forecast, which flatters its accuracy somewhat."
     )
+    section_forecast_diagnostics()
+
+
+def show_dm_table(dm: pd.DataFrame, test: str) -> None:
+    table = dashboard.dm_view(dm, test)
+    if table.empty:
+        return
+    st.dataframe(
+        table.style.format(
+            {
+                "Mean difference (a − b)": "{:,.1f}",
+                "DM statistic": "{:,.2f}",
+                "p-value": lambda p: "< 0.001" if p < 0.001 else f"{p:.3f}",
+            }
+        ),
+        **TABLE_WIDTH,
+        hide_index=True,
+    )
+
+
+def section_forecast_diagnostics() -> None:
+    """Significance tests, error by hour, and SHAP importance (diagnostics.py)."""
+    dm, breakdown, shap = load("dm_tests"), load("error_breakdown"), load("shap_importance")
+    if dm is None and breakdown is None and shap is None:
+        return
+    st.subheader("Forecast diagnostics (2019)")
+    if dm is not None:
+        st.markdown(
+            "**Are the accuracy differences real?** Diebold-Mariano tests on hourly errors, "
+            "with a Newey-West variance over one week of lags, because day-ahead errors are "
+            "strongly autocorrelated. A small p-value means the difference is unlikely to "
+            "be chance."
+        )
+        show_dm_table(dm, "forecast_error")
+    c1, c2 = st.columns(2)
+    if breakdown is not None:
+        hourly = breakdown[breakdown["slice"] == "hour"].copy()
+        hourly["hour"] = hourly["group"].astype(int)
+        fig = go.Figure()
+        for col, label in dashboard.FORECAST_COLUMN_LABELS.items():
+            rows = hourly[hourly["model"] == col].sort_values("hour")
+            if not rows.empty:
+                fig.add_trace(
+                    go.Scatter(x=rows["hour"], y=rows["mae"], name=label, mode="lines+markers",
+                               line={"color": FORECAST_COLORS[col], "width": 2})
+                )  # fmt: skip
+        fig.update_layout(xaxis_title="Local hour of day", yaxis_title="MAE (MW)")
+        with c1:
+            show(fig, "Forecast error by hour of day")
+    if shap is not None:
+        top = shap.head(12).iloc[::-1]
+        fig = go.Figure(
+            go.Bar(x=top["mean_abs_shap_mw"], y=top["feature"], orientation="h",
+                   marker_color=FORECAST_COLORS["y_lgbm"], name="Mean |SHAP|")
+        )  # fmt: skip
+        fig.update_layout(xaxis_title="Mean |SHAP value| (MW)", showlegend=False, bargap=0.3)
+        with c2:
+            show(fig, "What drives the LightGBM forecast (SHAP)", hovermode="closest")
+            st.caption(
+                "Average absolute contribution of each feature to the 2019 predictions, "
+                "from the model the backtest trains for its first test month."
+            )
 
 
 def page_dispatch() -> None:
@@ -475,6 +537,13 @@ def page_cost() -> None:
         "TSO forecast instead of LightGBM", eur(head["tso_vs_lightgbm"]["saving_eur"]) + "/yr"
     )
     c2.caption(f"{head['tso_vs_lightgbm']['saving_pct']:.2f}% lower realized cost")
+    dm = load("dm_tests")
+    if dm is not None and (dm["test"] == "realized_cost").any():
+        st.markdown(
+            "**Are the cost differences real?** Diebold-Mariano tests on hourly realized "
+            "cost (€/hour, battery off), with the same autocorrelation-robust variance."
+        )
+        show_dm_table(dm, "realized_cost")
 
     st.markdown("**Battery value under each planning forecast**")
     battery = dashboard.battery_value_by_forecast(summary)
