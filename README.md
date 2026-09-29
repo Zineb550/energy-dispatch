@@ -83,7 +83,7 @@ its worst are December (871), January (694), April (664, Easter) and August
 **What drives it (SHAP, LightGBM TreeSHAP on 2019 features).** Hour of day
 (40%) and weekday (21%) dominate, then the recent demand level (24 h and
 168 h rolling means, 15%) and weather (about 12% combined). `is_holiday`
-accounts for only 2%: with few holidays in three training years the model
+accounts for only 2%: with only 8-10 national holidays a year in the training history, the model
 barely learns them, which matches the error breakdown. `lag_24h` carries
 only 1.4% because lags are anchored to the 10:00 cutoff (the value 24 h
 before the cutoff, not before the target hour): leakage safety costs some
@@ -230,13 +230,18 @@ dashboard page. `ruff` clean.
 - **One test year.** 2019 only; 2019-12-24 excluded (missing solar/wind
   data). 2020 was held out of the split because of COVID, but no stress
   test has been run on it yet.
+- **Quantile tuning on the test year.** The hyperparameter sweep for the
+  quantile models was scored on 2019. Conformal calibration then re-corrects
+  coverage from past data only, so the effect is likely small, but strictly
+  the sweep should use 2018 as a validation year.
 - **Quantile interpolation.** Plans between q10, point and q90 assume a
   Gaussian-shaped error; dedicated quantile models at τ\* would be cleaner.
 
 ## Next steps
 
-- **Holiday features** (bridge days, Easter week, regional holidays, August
-  vacation): the largest identified source of error against the TSO.
+- **Holiday features** (Easter week, regional holidays, August
+  vacation; bridge days are already a feature): the largest identified
+  source of error against the TSO.
 - **Real-time re-dispatch** (two-stage planning), letting the battery and
   curtailed renewables respond to actual demand.
 - **Hour-dependent planning quantile** based on the marginal unit (τ\* ≈ 0.78
